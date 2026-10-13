@@ -15,6 +15,8 @@ from django.shortcuts import get_object_or_404
 from ninja import Router, Schema
 from ninja.errors import HttpError
 
+from p2.core.auth_policy import SSOSettings
+
 LOGGER = logging.getLogger(__name__)
 
 router_sso = Router(tags=["system-sso-providers"])
@@ -53,6 +55,24 @@ class PublicProviderSchema(Schema):
     login_url: str
 
 
+class SSOSettingsSchema(Schema):
+    allowed_email_domains: str = ""
+    allow_jit_signup: bool = False
+
+
+def _normalize_domains(raw: str) -> str:
+    seen = []
+    for part in (raw or "").replace("\n", ",").split(","):
+        domain = part.strip().lower().lstrip("@")
+        if not domain:
+            continue
+        if "." not in domain or " " in domain or "/" in domain or "@" in domain:
+            raise HttpError(400, f"'{part.strip()}' is not a valid email domain.")
+        if domain not in seen:
+            seen.append(domain)
+    return ", ".join(seen)
+
+
 def _require_superuser(request):
     if not getattr(request.user, "is_authenticated", False) or not getattr(request.user, "is_superuser", False):
         raise PermissionDenied("Superuser privileges required.")
@@ -80,6 +100,31 @@ def public_providers(request):
         )
         for app in apps
     ]
+
+
+@router_sso.get("/settings/", response=SSOSettingsSchema)
+def get_sso_settings(request):
+    _require_superuser(request)
+    cfg = SSOSettings.load()
+    return SSOSettingsSchema(
+        allowed_email_domains=cfg.allowed_email_domains,
+        allow_jit_signup=cfg.allow_jit_signup,
+    )
+
+
+@router_sso.put("/settings/", response=SSOSettingsSchema)
+def update_sso_settings(request, payload: SSOSettingsSchema):
+    _require_superuser(request)
+    cfg = SSOSettings.load()
+    cfg.allowed_email_domains = _normalize_domains(payload.allowed_email_domains)
+    cfg.allow_jit_signup = payload.allow_jit_signup
+    cfg.save()
+    LOGGER.info("SSO settings updated by %s: domains=%r jit=%s",
+                request.user.get_username(), cfg.allowed_email_domains, cfg.allow_jit_signup)
+    return SSOSettingsSchema(
+        allowed_email_domains=cfg.allowed_email_domains,
+        allow_jit_signup=cfg.allow_jit_signup,
+    )
 
 
 @router_sso.get("/", response=List[SocialAppSchema])

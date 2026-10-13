@@ -150,6 +150,7 @@ INSTALLED_APPS = [
     # Third-party
     'ninja',
     'ninja_jwt',
+    'ninja_jwt.token_blacklist',  # lets us revoke refresh tokens (see p2/auth/mfa_api.py)
     'django_filters',
     'crispy_forms',
     'crispy_bootstrap4',
@@ -362,8 +363,10 @@ SOCIALACCOUNT_PROVIDERS = {
 # 2FA on their own local/password account instead of using a social login).
 # ---------------------------------------------------------------------------
 MFA_TOTP_ISSUER = CONFIG.y('mfa.totp_issuer', 'p2 Storage')
-# Allow ±2 time steps (±60 seconds) clock skew for authenticator apps (RFC 6238)
-MFA_TOTP_TOLERANCE = int(CONFIG.y('mfa.totp_tolerance', default=2))
+# Allow ±1 time step (±30 seconds) clock skew for authenticator apps (RFC 6238).
+# Each extra step adds another valid code at any instant, which widens the
+# window for online guessing.
+MFA_TOTP_TOLERANCE = int(CONFIG.y('mfa.totp_tolerance', default=1))
 # A short-lived, single-use "MFA challenge" token is minted after password
 # auth succeeds for a user with 2FA enabled, and must be exchanged (together
 # with a valid TOTP/recovery code) for the real ninja-jwt pair within this

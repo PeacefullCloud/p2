@@ -81,8 +81,19 @@ class LoginResponseSchema(Schema):
     mfa_token: str | None = None
     mfa_setup_required: bool = False
     enrollment_token: str | None = None
+    password_change_required: bool = False
+    password_change_token: str | None = None
     access: str | None = None
     refresh: str | None = None
+
+
+class SsoExchangeSchema(Schema):
+    code: str
+
+
+class PasswordChangeSchema(Schema):
+    password_change_token: str
+    new_password: str
 
 
 class MfaVerifySchema(Schema):
@@ -120,6 +131,14 @@ class CurrentUserSchema(Schema):
     is_staff: bool
 
 
+def _revoke_refresh_tokens(user) -> None:
+    """Blacklist every outstanding refresh token for *user*, so a security
+    change (e.g. 2FA disabled) also cuts off sessions that already exist."""
+    from ninja_jwt.token_blacklist.models import BlacklistedToken, OutstandingToken
+    for outstanding in OutstandingToken.objects.filter(user=user):
+        BlacklistedToken.objects.get_or_create(token=outstanding)
+
+
 def _mint_jwt_pair(user) -> dict:
     refresh = RefreshToken.for_user(user)
     refresh['is_superuser'] = bool(user.is_superuser)
@@ -145,6 +164,8 @@ def current_user(request):
 def _issue_mfa_challenge(user) -> str:
     """Create a single-use, short-lived token binding this login attempt to
     `user`, so /mfa/verify doesn't need the password again."""
+    if _throttled('mfa-user', str(user.pk), _MFA_FAILS_PER_USER):
+        raise HttpError(429, "Too many incorrect verification codes. Try again later.")
     token = secrets.token_urlsafe(32)
     cache.set(f'{_CHALLENGE_CACHE_PREFIX}{token}', user.pk, timeout=settings.MFA_CHALLENGE_TTL_SECONDS)
     return token
@@ -163,9 +184,55 @@ def _peek_mfa_challenge(token: str):
     return User.objects.filter(pk=user_pk, is_active=True).first()
 
 
-def _delete_mfa_challenge(token: str) -> None:
-    cache.delete(f'{_CHALLENGE_CACHE_PREFIX}{token}')
+def _delete_mfa_challenge(token: str) -> bool:
+    """Burn a challenge. True only for the caller that actually removed it, so
+    two concurrent verifications of one challenge cannot both succeed."""
+    deleted = cache.delete(f'{_CHALLENGE_CACHE_PREFIX}{token}')
     cache.delete(f'{_ATTEMPT_CACHE_PREFIX}{token}')
+    return bool(deleted)
+
+
+# ---------------------------------------------------------------------------
+# Failure throttling
+# ---------------------------------------------------------------------------
+# The per-challenge attempt cap only bounds guesses on one challenge; anyone
+# holding the password could otherwise mint challenges forever. These counters
+# are keyed on identity (account / client IP), not on a token.
+
+_THROTTLE_PREFIX = 'p2:auth:fail:'
+_THROTTLE_WINDOW_SECONDS = 15 * 60
+_LOGIN_FAILS_PER_ACCOUNT_IP = 10
+_LOGIN_FAILS_PER_ACCOUNT = 50
+_LOGIN_FAILS_PER_IP = 100
+_MFA_FAILS_PER_USER = 10
+_DISABLE_FAILS_PER_USER = 5
+
+
+def _client_ip(request) -> str:
+    # REMOTE_ADDR only: X-Forwarded-For is client-controlled unless a trusted
+    # proxy strips it, and a spoofable key would let attackers dodge the limit.
+    return request.META.get('REMOTE_ADDR', '') or 'unknown'
+
+
+def _throttle_key(scope: str, ident: str) -> str:
+    return f'{_THROTTLE_PREFIX}{scope}:{ident}'
+
+
+def _throttled(scope: str, ident: str, limit: int) -> bool:
+    return (cache.get(_throttle_key(scope, ident)) or 0) >= limit
+
+
+def _record_failure(scope: str, ident: str) -> None:
+    key = _throttle_key(scope, ident)
+    cache.add(key, 0, timeout=_THROTTLE_WINDOW_SECONDS)
+    try:
+        cache.incr(key)
+    except ValueError:
+        cache.set(key, 1, timeout=_THROTTLE_WINDOW_SECONDS)
+
+
+def _clear_failures(scope: str, ident: str) -> None:
+    cache.delete(_throttle_key(scope, ident))
 
 
 def _normalize_code(code: str) -> str:
@@ -215,6 +282,58 @@ def _delete_enrollment_token(token: str) -> None:
     cache.delete(f'{_ENROLLMENT_CACHE_PREFIX}{token}')
 
 
+_PWCHANGE_CACHE_PREFIX = 'p2:auth:pwchange:'
+
+
+def _issue_password_change_token(user, via: str) -> str:
+    """Single-use token for the forced password change. Remembers which
+    sign-in path produced it so the flow can resume exactly there."""
+    token = secrets.token_urlsafe(32)
+    cache.set(f'{_PWCHANGE_CACHE_PREFIX}{token}', {'pk': user.pk, 'via': via},
+              timeout=settings.MFA_CHALLENGE_TTL_SECONDS)
+    return token
+
+
+def _peek_password_change_token(token: str):
+    """Return (user, via) without consuming the token, or (None, None)."""
+    if not token:
+        return None, None
+    data = cache.get(f'{_PWCHANGE_CACHE_PREFIX}{token}')
+    if not data:
+        return None, None
+    user = User.objects.filter(pk=data['pk'], is_active=True).first()
+    return (user, data['via']) if user else (None, None)
+
+
+def _must_change_password(user) -> bool:
+    from p2.core.auth_policy import password_change_required
+    return password_change_required(user)
+
+
+_SSO_CODE_CACHE_PREFIX = 'p2:sso:code:'
+_SSO_CODE_TTL_SECONDS = 60
+
+
+def _issue_sso_code(user) -> str:
+    """Opaque single-use code handed to the SPA in the post-SSO redirect, in
+    place of putting JWTs in the URL."""
+    code = secrets.token_urlsafe(32)
+    cache.set(f'{_SSO_CODE_CACHE_PREFIX}{code}', user.pk, timeout=_SSO_CODE_TTL_SECONDS)
+    return code
+
+
+def _consume_sso_code(code: str):
+    """Return the active User for *code* and burn it, or None. The delete's
+    return value is the atomic guard, so concurrent exchanges cannot both win."""
+    if not code:
+        return None
+    key = f'{_SSO_CODE_CACHE_PREFIX}{code}'
+    user_pk = cache.get(key)
+    if user_pk is None or not cache.delete(key):
+        return None
+    return User.objects.filter(pk=user_pk, is_active=True).first()
+
+
 # ---------------------------------------------------------------------------
 # Login (first factor + MFA gate)
 # ---------------------------------------------------------------------------
@@ -228,10 +347,32 @@ def login(request, payload: LoginSchema):
     (SSO_REQUIRED), force TOTP enrollment (MFA_REQUIRED / SSO_OR_MFA), or
     allow bare password (NONE).
     """
+    uname = (payload.username or '').strip().lower()[:150]
+    ip = _client_ip(request)
+    if (
+        _throttled('login-acct-ip', f'{uname}|{ip}', _LOGIN_FAILS_PER_ACCOUNT_IP)
+        or _throttled('login-acct', uname, _LOGIN_FAILS_PER_ACCOUNT)
+        or _throttled('login-ip', ip, _LOGIN_FAILS_PER_IP)
+    ):
+        raise HttpError(429, "Too many failed sign-in attempts. Try again later.")
+
     user = authenticate(request, username=payload.username, password=payload.password)
     if user is None or not user.is_active:
+        _record_failure('login-acct-ip', f'{uname}|{ip}')
+        _record_failure('login-acct', uname)
+        _record_failure('login-ip', ip)
         raise HttpError(401, "No active account found with the given credentials")
+    _clear_failures('login-acct-ip', f'{uname}|{ip}')
 
+    if _must_change_password(user):
+        return LoginResponseSchema(
+            password_change_required=True,
+            password_change_token=_issue_password_change_token(user, 'password'),
+        )
+    return _finish_password_login(user)
+
+
+def _finish_password_login(user) -> LoginResponseSchema:
     # ── superuser exemption (§5.1) ──────────────────────────────────────
     if user.is_superuser:
         if _totp_authenticator(user) is not None:
@@ -259,6 +400,88 @@ def login(request, payload: LoginSchema):
     return LoginResponseSchema(**_mint_jwt_pair(user))
 
 
+@router_login.post('/sso/exchange', response=LoginResponseSchema, auth=None)
+def sso_exchange(request, payload: SsoExchangeSchema):
+    """Trade the single-use code from the SSO redirect for tokens, applying
+    the auth policy: a user who must enrol TOTP gets an enrollment token
+    instead of a JWT pair."""
+    user = _consume_sso_code(payload.code)
+    if user is None:
+        raise HttpError(401, "SSO sign-in expired or already used. Please sign in again.")
+
+    if _must_change_password(user):
+        return LoginResponseSchema(
+            password_change_required=True,
+            password_change_token=_issue_password_change_token(user, 'sso'),
+        )
+    return _finish_sso_login(user)
+
+
+def _finish_sso_login(user) -> LoginResponseSchema:
+    if not user.is_superuser:
+        try:
+            from p2.core.auth_policy import AuthPolicy, resolve_policy
+            needs_mfa = resolve_policy(user) == AuthPolicy.Requirement.MFA_REQUIRED
+        except Exception:
+            # Fail closed: an unevaluable policy must not yield a token.
+            LOGGER.exception("Auth policy check failed during SSO exchange")
+            raise HttpError(503, "Could not evaluate sign-in policy. Please try again.")
+        if needs_mfa:
+            if _totp_authenticator(user) is None:
+                return LoginResponseSchema(
+                    mfa_setup_required=True,
+                    enrollment_token=_issue_enrollment_token(user),
+                )
+            # MFA_REQUIRED means a second factor on every sign-in, not only
+            # at enrolment; SSO_OR_MFA accepts SSO alone.
+            return LoginResponseSchema(mfa_required=True, mfa_token=_issue_mfa_challenge(user))
+    return LoginResponseSchema(**_mint_jwt_pair(user))
+
+
+@router_login.post('/password-change', response=LoginResponseSchema, auth=None)
+def password_change(request, payload: PasswordChangeSchema):
+    """Set a new password for an account flagged as needing one (e.g. the
+    seeded ``admin/admin``), then resume the sign-in path that got us here —
+    MFA, enrolment and policy still apply, so this alone never yields tokens
+    for accounts that need a second factor."""
+    from django.contrib.auth.password_validation import validate_password
+    from django.core.exceptions import ValidationError
+    from django.db import transaction
+
+    from p2.core.auth_policy import PasswordChangeRequired
+
+    ip = _client_ip(request)
+    if _throttled('pwchange-ip', ip, _LOGIN_FAILS_PER_IP):
+        raise HttpError(429, "Too many attempts. Try again later.")
+
+    user, via = _peek_password_change_token(payload.password_change_token)
+    if user is None:
+        _record_failure('pwchange-ip', ip)
+        raise HttpError(401, "Password change expired or already used. Please sign in again.")
+
+    new_password = payload.new_password or ''
+    if user.check_password(new_password):
+        raise HttpError(400, "The new password must be different from the current one.")
+    try:
+        validate_password(new_password, user)
+    except ValidationError as exc:
+        raise HttpError(400, ' '.join(exc.messages))
+
+    key = f'{_PWCHANGE_CACHE_PREFIX}{payload.password_change_token}'
+    if not cache.delete(key):
+        raise HttpError(401, "Password change expired or already used. Please sign in again.")
+    with transaction.atomic():
+        user.set_password(new_password)
+        user.save(update_fields=['password'])
+        PasswordChangeRequired.objects.filter(user=user).delete()
+    _revoke_refresh_tokens(user)
+    LOGGER.info("Forced password change completed for user=%s", user.get_username())
+
+    if via == 'sso':
+        return _finish_sso_login(user)
+    return _finish_password_login(user)
+
+
 @router_mfa.post('/verify', response=LoginResponseSchema, auth=None)
 def verify(request, payload: MfaVerifySchema):
     """Second factor. The challenge stays valid for retries until it
@@ -270,12 +493,19 @@ def verify(request, payload: MfaVerifySchema):
     if user is None:
         raise HttpError(401, "MFA challenge expired or already used. Please log in again.")
 
+    if _throttled('mfa-user', str(user.pk), _MFA_FAILS_PER_USER):
+        _delete_mfa_challenge(payload.mfa_token)
+        raise HttpError(429, "Too many incorrect verification codes. Try again later.")
+
     code = _normalize_code(payload.code)
     if code and _validate_second_factor(user, code):
-        _delete_mfa_challenge(payload.mfa_token)
+        if not _delete_mfa_challenge(payload.mfa_token):
+            raise HttpError(401, "MFA challenge expired or already used. Please log in again.")
+        _clear_failures('mfa-user', str(user.pk))
         LOGGER.debug("MFA verify: user=%s", user.get_username())
         return LoginResponseSchema(**_mint_jwt_pair(user))
 
+    _record_failure('mfa-user', str(user.pk))
     attempts_key = f'{_ATTEMPT_CACHE_PREFIX}{payload.mfa_token}'
     try:
         attempts = cache.incr(attempts_key)
@@ -350,8 +580,14 @@ def confirm(request, payload: MfaConfirmSchema):
 def disable(request, payload: MfaDisableSchema):
     """Require the current password (not just a bearer token) before turning
     off 2FA, so a stolen/leaked access token alone can't disable it."""
+    uid = str(request.user.pk)
+    if _throttled('disable-user', uid, _DISABLE_FAILS_PER_USER):
+        raise HttpError(429, "Too many incorrect passwords. Try again later.")
     if not request.user.check_password(payload.password):
+        _record_failure('disable-user', uid)
         raise HttpError(401, "Incorrect password.")
+    _clear_failures('disable-user', uid)
+    _revoke_refresh_tokens(request.user)
 
     Authenticator.objects.filter(
         user=request.user,
@@ -406,7 +642,10 @@ def enroll_confirm(request, payload: EnrollmentConfirmSchema):
     if not secret:
         raise HttpError(400, 'No pending 2FA setup. Call /mfa/enroll-setup first.')
 
+    if _throttled('mfa-user', str(user.pk), _MFA_FAILS_PER_USER):
+        raise HttpError(429, 'Too many incorrect codes. Try again later.')
     if not validate_totp_code(secret, payload.code):
+        _record_failure('mfa-user', str(user.pk))
         raise HttpError(400, 'Incorrect code.')
 
     cache.delete(f'{_PENDING_SECRET_CACHE_PREFIX}{user.pk}')

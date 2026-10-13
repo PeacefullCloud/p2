@@ -46,6 +46,10 @@ export function useLogin() {
     await execute()
     if (error.value) throw error.value
     const result = data.value
+    if (result?.password_change_required) {
+      // Default/flagged credentials: no tokens until a new password is set.
+      return { passwordChangeRequired: true, passwordChangeToken: result.password_change_token }
+    }
     if (result?.mfa_required) {
       // Caller (LoginPage.vue) must prompt for a TOTP/recovery code and
       // call useMfaVerify().verify(result.mfa_token, code) to finish login.

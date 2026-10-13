@@ -13,6 +13,7 @@ const {
   authPolicies, authPoliciesLoading, fetchAuthPolicies, createAuthPolicy, updateAuthPolicy, deleteAuthPolicy, getAffectedCount,
   groups, groupsLoading, fetchGroups,
   ssoProviders, ssoProvidersLoading, fetchSsoProviders, availableProviders, createSsoProvider, updateSsoProvider, deleteSsoProvider,
+  ssoSettings, fetchSsoSettings, saveSsoSettings,
 } = useSettingsSingleton()
 
 const activeTab = ref('keys')
@@ -484,6 +485,36 @@ function promptDeleteSso(app) {
   })
 }
 
+// ── SSO sign-in rules ──────────────────────────────────────────────────────
+const ssoRuleDomains = ref('')
+const ssoRuleJit = ref(false)
+const ssoRulesSaving = ref(false)
+
+watch(() => ssoSettings.value, (v) => {
+  ssoRuleDomains.value = v?.allowed_email_domains || ''
+  ssoRuleJit.value = !!v?.allow_jit_signup
+}, { immediate: true, deep: true })
+
+const ssoRulesChanged = computed(() =>
+  ssoRuleDomains.value !== (ssoSettings.value?.allowed_email_domains || '') ||
+  ssoRuleJit.value !== !!ssoSettings.value?.allow_jit_signup,
+)
+
+async function handleSaveSsoRules() {
+  ssoRulesSaving.value = true
+  try {
+    await saveSsoSettings({
+      allowed_email_domains: ssoRuleDomains.value,
+      allow_jit_signup: ssoRuleJit.value,
+    })
+    toast.success('SSO sign-in rules saved')
+  } catch (e) {
+    toast.error(e.message || 'Failed to save SSO rules')
+  } finally {
+    ssoRulesSaving.value = false
+  }
+}
+
 // ── Helpers ────────────────────────────────────────────────────────────────
 function copyToClipboard(text) {
   navigator.clipboard.writeText(text)
@@ -792,6 +823,42 @@ async function handleDisableMfa(close) {
             </div>
             <div v-if="!ssoProviders.length" class="px-4 py-8 text-center text-p-sm text-ink-gray-5">
               No SSO providers configured yet. Click "Add Provider" to connect Google, GitHub, or Microsoft.
+            </div>
+          </div>
+
+          <!-- Sign-in rules -->
+          <div class="rounded-md border border-outline-gray-1 bg-surface-white p-5 space-y-4">
+            <div>
+              <h3 class="text-base font-medium text-ink-gray-8">Sign-in rules</h3>
+              <p class="text-xs text-ink-gray-5 mt-0.5">
+                A user whose provider-verified email matches an existing p2 user is linked to
+                that user on first SSO sign-in. These rules control everyone else.
+              </p>
+            </div>
+            <FormControl
+              v-model="ssoRuleDomains"
+              label="Allowed email domains"
+              type="text"
+              placeholder="example.com, example.org (leave empty to allow any domain)"
+            />
+            <label class="flex items-start gap-3 cursor-pointer">
+              <input type="checkbox" v-model="ssoRuleJit" class="mt-1" />
+              <span>
+                <span class="block text-sm font-medium text-ink-gray-9">Create users on first SSO sign-in</span>
+                <span class="block text-xs text-ink-gray-5">
+                  Off: only people you have already created can sign in with SSO.
+                  On: anyone with a verified email in the allowed domains gets an account
+                  with no bucket access until you grant it.
+                </span>
+              </span>
+            </label>
+            <div class="flex items-center gap-3">
+              <Button
+                variant="solid" theme="gray" label="Save rules"
+                :loading="ssoRulesSaving" :disabled="!ssoRulesChanged"
+                @click="handleSaveSsoRules"
+              />
+              <span v-if="ssoRulesChanged" class="text-xs text-orange-600">Unsaved changes</span>
             </div>
           </div>
         </div>
@@ -1190,9 +1257,9 @@ async function handleDisableMfa(close) {
 
           <FormControl
             v-model="ssoName"
-            label="Display Name"
+            label="Button Text (shown on the login page)"
             type="text"
-            placeholder="Google Workspace, GitHub Org, etc."
+            placeholder="Sign in with Google"
             required
           />
 

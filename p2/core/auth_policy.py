@@ -88,3 +88,52 @@ def resolve_policy(user) -> str:
 
     candidates = group_reqs + [global_req]
     return max(candidates, key=lambda r: _STRICTNESS.get(r, 0))
+
+
+class SSOSettings(models.Model):
+    """Singleton (pk=1) holding admin-editable SSO sign-in rules."""
+
+    allowed_email_domains = models.TextField(
+        blank=True, default='',
+        help_text='Comma-separated email domains allowed to sign in with SSO. '
+                  'Empty falls back to the sso.allowed_email_domains config value, '
+                  'and if that is empty too, any domain is allowed.',
+    )
+    allow_jit_signup = models.BooleanField(
+        default=False,
+        help_text='Create a local user on first SSO login when no existing user '
+                  'matches. When off, only users an admin already created can sign in.',
+    )
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'SSO settings'
+        verbose_name_plural = 'SSO settings'
+
+    @classmethod
+    def load(cls) -> 'SSOSettings':
+        obj, _ = cls.objects.get_or_create(pk=1)
+        return obj
+
+    def domains(self) -> set[str]:
+        raw = self.allowed_email_domains
+        if not raw.strip():
+            from p2.lib.config import CONFIG
+            raw = str(CONFIG.y('sso.allowed_email_domains', '') or '')
+        return {d.strip().lower().lstrip('@') for d in raw.split(',') if d.strip()}
+
+
+class PasswordChangeRequired(models.Model):
+    """Presence of a row means the user must set a new password before any
+    sign-in path (password, SSO, session) is allowed to issue credentials."""
+
+    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='password_change_required')
+    reason = models.CharField(max_length=64, default='default_credentials')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"PasswordChangeRequired({self.user_id}: {self.reason})"
+
+
+def password_change_required(user) -> bool:
+    return PasswordChangeRequired.objects.filter(user=user).exists()

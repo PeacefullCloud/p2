@@ -14,6 +14,8 @@ from p2.api.schemas import (
     UserSchema,
     UserUpdateSchema,
 )
+from p2.auth.mfa_api import _revoke_refresh_tokens
+from p2.core.auth_policy import PasswordChangeRequired
 from p2.s3.cache import invalidate_apikey
 from p2.lib.config import CONFIG
 
@@ -78,7 +80,12 @@ def update_user(request, user_id: int, payload: UserUpdateSchema):
         target.is_staff = payload.is_superuser
     if payload.password:
         target.set_password(payload.password)
+        # An admin deliberately choosing a password replaces the default one.
+        PasswordChangeRequired.objects.filter(user=target).delete()
     target.save()
+    if payload.password or payload.is_active is False:
+        # Cut off sessions that predate the reset or deactivation.
+        _revoke_refresh_tokens(target)
     if payload.groups is not None:
         target.groups.clear()
         for gname in payload.groups:

@@ -29,7 +29,9 @@ const configuredProviders = ref([])
 const ssoProviders = computed(() =>
   configuredProviders.value.map((p) => ({
     id: p.id,
-    label: providerMeta[p.id]?.label || p.name || p.id,
+    // The admin-configured Display Name (Settings > SSO Providers) is the
+    // button text; the built-in label is only a fallback.
+    label: p.name?.trim() || providerMeta[p.id]?.label || p.id,
     icon: providerMeta[p.id]?.icon || 'key',
     loginUrl: p.login_url || `/_/accounts/${p.id}/login/`,
   })),
@@ -126,35 +128,139 @@ function cancelEnrollment() {
   error.message = ''
 }
 
-// After a successful SSO round trip, P2AccountAdapter redirects back to
-// /login?access=...&refresh=... — pick the tokens up here the same way
-// useLogin() does for password auth, then continue into the app.
+// After a successful SSO round trip the server redirects back to
+// /login?sso_code=... — an opaque single-use code, never a token. Exchange it
+// over POST, then continue the same way as password auth.
+// Reason codes sent by the server in /login?sso_error=<code>.
+const SSO_ERRORS = {
+  no_account: 'No account exists for this email. Ask your administrator to add you, then try again.',
+  email_unverified: 'Your provider did not confirm your email address, so we cannot sign you in with it.',
+  domain_not_allowed: 'Your email domain is not allowed to sign in here.',
+  ambiguous_account: 'More than one account uses this email. Contact your administrator.',
+  account_disabled: 'This account is disabled. Contact your administrator.',
+  cancelled: 'Sign-in was cancelled.',
+  provider_error: 'The sign-in provider returned an error. Please try again.',
+  policy_check_failed: 'Sign-in could not be completed. Please try again.',
+  login_failed: 'Sign-in could not be completed. Please try again.',
+  default: 'SSO sign-in failed. Please try again or contact an administrator.',
+}
+
+// Forced password change (default admin/admin, or any flagged account).
+const passwordStep = ref(false)
+const passwordChangeToken = ref('')
+const newPassword = ref('')
+const confirmPassword = ref('')
+const changingPassword = ref(false)
+
+// Route a server login response to whichever step comes next.
+async function continueAfterAuth(data, replace = false) {
+  if (data.password_change_required && data.password_change_token) {
+    passwordChangeToken.value = data.password_change_token
+    newPassword.value = ''
+    confirmPassword.value = ''
+    mfaStep.value = false
+    passwordStep.value = true
+    return
+  }
+  passwordStep.value = false
+  if (data.mfa_setup_required && data.enrollment_token) {
+    await startForcedEnrollment(data.enrollment_token)
+    return
+  }
+  if (data.mfa_required && data.mfa_token) {
+    mfaToken.value = data.mfa_token
+    mfaStep.value = true
+    return
+  }
+  saveTokens(data.access, data.refresh)
+  decodeUserFromToken(data.access)
+  toast.success('Welcome back!')
+  const target = { name: 'Dashboard' }
+  if (replace) router.replace(target)
+  else router.push(target)
+}
+
+async function handlePasswordChange() {
+  error.message = ''
+  if (newPassword.value !== confirmPassword.value) {
+    error.message = 'The two passwords do not match.'
+    return
+  }
+  changingPassword.value = true
+  try {
+    const resp = await fetch('/api/v1/auth/password-change', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        password_change_token: passwordChangeToken.value,
+        new_password: newPassword.value,
+      }),
+    })
+    const data = await resp.json().catch(() => ({}))
+    if (!resp.ok) {
+      if (resp.status === 401 || resp.status === 429) cancelPasswordChange()
+      throw new Error(data.detail || 'Could not change the password.')
+    }
+    form.password = ''
+    await continueAfterAuth(data)
+  } catch (e) {
+    error.message = e.message
+  } finally {
+    changingPassword.value = false
+  }
+}
+
+function cancelPasswordChange() {
+  passwordStep.value = false
+  passwordChangeToken.value = ''
+  newPassword.value = ''
+  confirmPassword.value = ''
+}
+
+async function exchangeSsoCode(code) {
+  try {
+    const resp = await fetch('/api/v1/auth/sso/exchange', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code }),
+    })
+    const data = await resp.json().catch(() => ({}))
+    if (!resp.ok) throw new Error(data.detail || 'SSO sign-in failed. Please try again.')
+    await continueAfterAuth(data, true)
+  } catch (e) {
+    error.message = e.message
+  }
+}
+
 onMounted(() => {
   fetchConfiguredProviders()
 
   const params = new URLSearchParams(window.location.search)
-  const access = params.get('access')
-  const refresh = params.get('refresh')
-  const ssoMfaSetup = params.get('mfa_setup_required')
-  const ssoEnrollToken = params.get('enrollment_token')
+  const ssoCode = params.get('sso_code')
+  const ssoError = params.get('sso_error')
 
-  if (ssoMfaSetup === 'true' && ssoEnrollToken) {
-    startForcedEnrollment(ssoEnrollToken)
+  if (ssoCode || ssoError) {
+    // Drop the one-time code from the address bar and history right away.
+    window.history.replaceState({}, '', window.location.pathname)
+  }
+  if (ssoError) {
+    error.message = SSO_ERRORS[ssoError] || SSO_ERRORS.default
     return
   }
-
-  if (access && refresh) {
-    saveTokens(access, refresh)
-    decodeUserFromToken(access)
-    toast.success('Welcome back!')
-    router.replace({ name: 'Dashboard' })
-  }
+  if (ssoCode) exchangeSsoCode(ssoCode)
 })
 
 async function handleLogin() {
   error.message = ''
   try {
     const result = await login(form.username, form.password)
+    if (result.passwordChangeRequired) {
+      await continueAfterAuth({
+        password_change_required: true,
+        password_change_token: result.passwordChangeToken,
+      })
+      return
+    }
     if (result.mfaRequired) {
       mfaToken.value = result.mfaToken
       mfaStep.value = true
@@ -238,6 +344,47 @@ function cancelMfa() {
           @click="finishEnrollment"
         />
       </div>
+
+      <!-- Forced password change (default or flagged credentials) -->
+      <form
+        v-else-if="passwordStep"
+        class="space-y-4 rounded-lg border border-outline-gray-1 bg-surface-white p-6 shadow-sm"
+        @submit.prevent="handlePasswordChange"
+      >
+        <div class="text-center">
+          <FeatherIcon name="lock" class="mx-auto mb-2 h-6 w-6 text-amber-600" />
+          <p class="text-p-base font-medium text-ink-gray-9">Set a new password</p>
+          <p class="mt-1 text-p-sm text-ink-gray-5">
+            This account is still using a default password. Choose a new one to continue.
+          </p>
+        </div>
+        <FormControl
+          v-model="newPassword"
+          type="password"
+          label="New password"
+          autocomplete="new-password"
+          required
+        />
+        <FormControl
+          v-model="confirmPassword"
+          type="password"
+          label="Confirm new password"
+          autocomplete="new-password"
+          required
+        />
+
+        <p v-if="error.message" class="text-p-sm text-ink-red-6">{{ error.message }}</p>
+
+        <Button
+          variant="solid"
+          theme="gray"
+          type="submit"
+          :loading="changingPassword"
+          label="Change password & continue"
+          class="w-full"
+        />
+        <Button variant="ghost" theme="gray" class="w-full" label="Cancel" @click="cancelPasswordChange" />
+      </form>
 
       <!-- Step 3: Forced TOTP Enrollment (required by policy) -->
       <div
@@ -362,7 +509,7 @@ function cancelMfa() {
         />
       </form>
 
-      <div v-if="!mfaStep && !enrollmentStep && !recoveryCodes && ssoProviders.length" class="mt-4 space-y-2">
+      <div v-if="!mfaStep && !passwordStep && !enrollmentStep && !recoveryCodes && ssoProviders.length" class="mt-4 space-y-2">
         <div class="flex items-center gap-2">
           <div class="h-px flex-1 bg-outline-gray-2" />
           <span class="text-p-xs text-ink-gray-5">or continue with</span>

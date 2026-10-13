@@ -362,9 +362,43 @@ export function useSettings() {
     return availableProviders.value
   })
 
+  // ── SSO sign-in rules (allowed domains, create-on-first-login) ──────────
+  const ssoSettings = ref({ allowed_email_domains: '', allow_jit_signup: false })
+  const ssoSettingsLoading = ref(false)
+
+  async function fetchSsoSettings() {
+    ssoSettingsLoading.value = true
+    try {
+      const resp = await fetch('/api/v1/system/sso-providers/settings/', {
+        headers: { Authorization: `Bearer ${localStorage.getItem('p2_token') || ''}` },
+      })
+      if (resp.ok) ssoSettings.value = await resp.json()
+    } finally {
+      ssoSettingsLoading.value = false
+    }
+  }
+
+  async function saveSsoSettings(payload) {
+    const resp = await fetch('/api/v1/system/sso-providers/settings/', {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${localStorage.getItem('p2_token') || ''}`,
+      },
+      body: JSON.stringify(payload),
+    })
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => ({}))
+      throw new Error(body.detail || `HTTP ${resp.status}`)
+    }
+    ssoSettings.value = await resp.json()
+    return ssoSettings.value
+  }
+
   // Auto-fetch superuser-only data only when user is a superuser
   watch(isSuperuser, (val) => {
     if (val) {
+      fetchSsoSettings()
       fetchUsers()
       fetchPolicies()
       fetchAuthPolicies()
@@ -486,6 +520,10 @@ export function useSettings() {
     createSsoProvider,
     updateSsoProvider,
     deleteSsoProvider,
+    ssoSettings,
+    ssoSettingsLoading,
+    fetchSsoSettings,
+    saveSsoSettings,
   }
 }
 
