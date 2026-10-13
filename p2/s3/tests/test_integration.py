@@ -204,7 +204,7 @@ class ObjectWriteTests(S3TestCase):
         # HEAD — verify metadata
         h = self.boto3.head_object(Bucket='test-1', Key='obj.txt')
         self.assertEqual(int(h['ContentLength']), len(data))
-        self.assertEqual(h['ContentType'], 'text/plain')
+        self.assertEqual(h['ContentType'], 'text/plain; charset=utf-8')
         self.assertTrue(h['ETag'].strip('"'))
 
         # Copy
