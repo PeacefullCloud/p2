@@ -2,6 +2,7 @@
 import hashlib
 import json
 import logging
+import mimetypes
 import os
 import uuid
 from typing import List, Optional
@@ -621,8 +622,11 @@ def upload_files(request, volume_uuid: str, prefix: str = "", file: List[Uploade
                 existing_size = int(existing_attr.get(ATTR_BLOB_SIZE_BYTES, 0) or 0)
                 existing_counted = True
         attrs = json.loads(existing_json) if existing_json else {}
+        upload_mime = uploaded_file.content_type
+        if not upload_mime or upload_mime == 'application/octet-stream':
+            upload_mime = mimetypes.guess_type(key)[0] or 'application/octet-stream'
         attrs.update({
-            ATTR_BLOB_MIME: uploaded_file.content_type or 'application/octet-stream',
+            ATTR_BLOB_MIME: upload_mime,
             ATTR_BLOB_SIZE_BYTES: str(blob_size),
             ATTR_BLOB_IS_FOLDER: False,
             ATTR_BLOB_STAT_MTIME: str(now()),
@@ -646,7 +650,7 @@ def upload_files(request, volume_uuid: str, prefix: str = "", file: List[Uploade
                 event_type="blob_post_save",
             )
             event['blob_path'] = key
-            event['mime'] = uploaded_file.content_type or 'application/octet-stream'
+            event['mime'] = upload_mime
             async_to_sync(publish_event)(STREAM_BLOB_POST_SAVE, event)
         except Exception as exc:
             LOGGER.warning("Failed to publish blob event: %s", exc)

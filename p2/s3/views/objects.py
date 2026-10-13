@@ -25,6 +25,8 @@ import asyncio
 import binascii
 import json
 import logging
+import mimetypes
+import os
 import uuid
 from email.utils import format_datetime
 from typing import Any
@@ -123,6 +125,81 @@ def _fmt_http_date(mtime_str: str) -> str | None:
 
 def _blocks_from_meta(meta: dict) -> list[BlockCoord]:
     return [BlockCoord.from_dict(b) for b in meta.get("blocks", [])]
+
+
+# Types a browser executes in the page's origin. Presigned URLs share the UI
+# origin, so these must not be able to run script against it.
+_ACTIVE_CONTENT_TYPES = frozenset({
+    "text/html", "application/xhtml+xml", "image/svg+xml", "text/xml", "application/xml",
+})
+_GENERIC_MIME_TYPES = frozenset({"", "application/octet-stream", "binary/octet-stream"})
+
+
+def _meta_size(meta: dict) -> int:
+    """Object size from either the block schema or the legacy UI-upload schema."""
+    return int(meta.get("size", meta.get(ATTR_BLOB_SIZE_BYTES, 0)) or 0)
+
+
+def _meta_etag(meta: dict) -> str:
+    return meta.get("etag", meta.get("blob.p2.io/hash/md5", "")) or ""
+
+
+def _meta_mtime(meta: dict) -> str:
+    return str(meta.get("mtime", meta.get(ATTR_BLOB_STAT_MTIME, "")) or "")
+
+
+def _meta_mime(meta: dict, key: str) -> str:
+    """Content-Type for an object.
+
+    Uploads that arrive without a real type (browsers and curl fall back to
+    application/octet-stream) are stored as such, which makes browsers download
+    instead of render. Infer the type from the key's extension in that case.
+    """
+    mime = meta.get("mime") or meta.get(ATTR_BLOB_MIME) or ""
+    if mime.split(";")[0].strip().lower() in _GENERIC_MIME_TYPES:
+        guessed, _ = mimetypes.guess_type(key)
+        mime = guessed or mime or "application/octet-stream"
+    if mime.startswith("text/") and "charset" not in mime.lower():
+        mime = f"{mime}; charset=utf-8"
+    return mime
+
+
+def _legacy_fs_path(meta: dict) -> str | None:
+    """Filesystem path of a legacy per-file object, or None for block objects."""
+    if meta.get("blocks"):
+        return None
+    internal_path = meta.get("internal_path")
+    if not internal_path:
+        return None
+    from p2.core.storage_path import internal_to_fs
+    return internal_to_fs(internal_path)
+
+
+def _read_file_range(fs_path: str, start: int, end: int) -> bytes:
+    with open(fs_path, "rb") as fh:
+        fh.seek(start)
+        return fh.read(end - start + 1)
+
+
+async def _stream_file_range(fs_path: str, start: int, end: int, chunk_size: int = 1024 * 1024):
+    remaining = end - start + 1
+    fh = await asyncio.to_thread(open, fs_path, "rb")
+    try:
+        await asyncio.to_thread(fh.seek, start)
+        while remaining > 0:
+            chunk = await asyncio.to_thread(fh.read, min(chunk_size, remaining))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+            yield chunk
+    finally:
+        await asyncio.to_thread(fh.close)
+
+
+def _harden_inline_response(response: HttpResponse, content_type: str) -> None:
+    response["X-Content-Type-Options"] = "nosniff"
+    if content_type.split(";")[0].strip().lower() in _ACTIVE_CONTENT_TYPES:
+        response["Content-Security-Policy"] = "sandbox"
 
 
 def _parse_tagging_xml(body: bytes) -> dict:
@@ -225,12 +302,12 @@ class ObjectView(S3View):
                 set_cached_metadata(volume.uuid.hex, path, meta)
 
         response = HttpResponse(status=200)
-        response["Content-Length"] = meta.get("size", 0)
-        response["Content-Type"] = meta.get("mime", "application/octet-stream")
-        lm = _fmt_http_date(meta.get("mtime", ""))
+        response["Content-Length"] = _meta_size(meta)
+        response["Content-Type"] = _meta_mime(meta, path)
+        lm = _fmt_http_date(_meta_mtime(meta))
         if lm:
             response["Last-Modified"] = lm
-        etag = meta.get("etag", "")
+        etag = _meta_etag(meta)
         if etag:
             response["ETag"] = f'"{etag}"'
         response["Accept-Ranges"] = "bytes"
@@ -277,9 +354,14 @@ class ObjectView(S3View):
                 set_cached_metadata(volume.uuid.hex, path, meta)
 
         blocks = _blocks_from_meta(meta)
-        obj_size = int(meta.get("size", 0))
-        content_type = meta.get("mime", "application/octet-stream")
-        etag = meta.get("etag", "")
+        legacy_path = _legacy_fs_path(meta)
+        obj_size = _meta_size(meta)
+        content_type = _meta_mime(meta, path)
+        etag = _meta_etag(meta)
+
+        if legacy_path and obj_size > 0 and not await asyncio.to_thread(os.path.exists, legacy_path):
+            LOGGER.error("GET: backing file missing for bucket=%s path=%r", bucket, path)
+            return HttpResponse(status=404)
 
         # 304 Not Modified
         if_none_match = request.META.get("HTTP_IF_NONE_MATCH")
@@ -292,11 +374,18 @@ class ObjectView(S3View):
 
         range_header = request.META.get("HTTP_RANGE")
         if range_header and obj_size > 0:
-            return await self._range_response(request, pool, blocks, content_type, obj_size, etag, meta, range_header, volume)
+            return await self._range_response(request, pool, blocks, content_type, obj_size, etag, meta, range_header, volume, legacy_path)
 
         # Full object streaming
-        lm = _fmt_http_date(meta.get("mtime", ""))
-        if obj_size <= 4 * 1024 * 1024:
+        lm = _fmt_http_date(_meta_mtime(meta))
+        if legacy_path:
+            if obj_size <= 4 * 1024 * 1024:
+                data = await asyncio.to_thread(_read_file_range, legacy_path, 0, obj_size - 1) if obj_size else b""
+                response = HttpResponse(data, content_type=content_type, status=200)
+            else:
+                response = StreamingHttpResponse(
+                    _stream_file_range(legacy_path, 0, obj_size - 1), content_type=content_type, status=200)
+        elif obj_size <= 4 * 1024 * 1024:
             data = await read_object(pool, blocks)
             response = HttpResponse(data, content_type=content_type, status=200)
         else:
@@ -314,9 +403,10 @@ class ObjectView(S3View):
             response["Content-Type"] = request.GET["response-content-type"]
         if "response-content-disposition" in request.GET:
             response["Content-Disposition"] = request.GET["response-content-disposition"]
+        _harden_inline_response(response, response["Content-Type"])
         return await self._apply_cors(request, response, volume)
 
-    async def _range_response(self, request, pool, blocks, content_type, obj_size, etag, meta, range_header, volume):
+    async def _range_response(self, request, pool, blocks, content_type, obj_size, etag, meta, range_header, volume, legacy_path=None):
         try:
             unit, ranges = range_header.split("=", 1)
             if unit.strip() != "bytes":
@@ -338,12 +428,19 @@ class ObjectView(S3View):
             return resp
 
         length = end - start + 1
-        slices = slice_blocks(blocks, start, end)
-
-        if length <= 4 * 1024 * 1024:
+        if legacy_path:
+            if length <= 4 * 1024 * 1024:
+                data = await asyncio.to_thread(_read_file_range, legacy_path, start, end)
+                response = HttpResponse(data, content_type=content_type, status=206)
+            else:
+                response = StreamingHttpResponse(
+                    _stream_file_range(legacy_path, start, end), content_type=content_type, status=206)
+        elif length <= 4 * 1024 * 1024:
             data = await read_range(pool, blocks, start, end)
             response = HttpResponse(data, content_type=content_type, status=206)
         else:
+            slices = slice_blocks(blocks, start, end)
+
             async def _gen():
                 async for chunk in stream_sliced_blocks(pool, slices):
                     yield chunk
@@ -354,9 +451,10 @@ class ObjectView(S3View):
         response["Accept-Ranges"] = "bytes"
         if etag:
             response["ETag"] = f'"{etag}"'
-        lm = _fmt_http_date(meta.get("mtime", ""))
+        lm = _fmt_http_date(_meta_mtime(meta))
         if lm:
             response["Last-Modified"] = lm
+        _harden_inline_response(response, content_type)
         return await self._apply_cors(request, response, volume)
 
     # ── POST ──────────────────────────────────────────────────────────────

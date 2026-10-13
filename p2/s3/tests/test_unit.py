@@ -288,3 +288,35 @@ class ErrorCodeTests(TestCase):
         self.assertEqual(AWSSignatureMismatch.code, 'SignatureDoesNotMatch')
         self.assertEqual(AWSAccessDenied.code, 'AccessDenied')
         self.assertEqual(AWSNoSuchKey.code, 'NoSuchKey')
+
+
+# ---------------------------------------------------------------------------
+# Object metadata: legacy UI-upload schema + mime inference
+# ---------------------------------------------------------------------------
+class ObjectMetadataHelperTests(SimpleTestCase):
+    def test_legacy_schema_is_read(self):
+        from p2.s3.views.objects import _meta_size, _meta_etag, _meta_mime
+        meta = {
+            'blob.p2.io/mime': 'image/png',
+            'blob.p2.io/size/bytes': '1234',
+            'blob.p2.io/hash/md5': 'abc',
+            'internal_path': '/internal-storage/volumes/x/aa/bb/cc',
+        }
+        self.assertEqual(_meta_size(meta), 1234)
+        self.assertEqual(_meta_etag(meta), 'abc')
+        self.assertEqual(_meta_mime(meta, 'a.png'), 'image/png')
+
+    def test_generic_mime_is_inferred_from_key(self):
+        from p2.s3.views.objects import _meta_mime
+        self.assertEqual(_meta_mime({'mime': 'application/octet-stream'}, 'a/b.jpg'), 'image/jpeg')
+        self.assertEqual(_meta_mime({}, 'notes.txt'), 'text/plain; charset=utf-8')
+        self.assertEqual(_meta_mime({}, 'blob.unknownext'), 'application/octet-stream')
+
+    def test_explicit_mime_is_kept(self):
+        from p2.s3.views.objects import _meta_mime
+        self.assertEqual(_meta_mime({'mime': 'video/mp4'}, 'x.bin'), 'video/mp4')
+
+    def test_legacy_path_only_for_non_block_objects(self):
+        from p2.s3.views.objects import _legacy_fs_path
+        self.assertIsNone(_legacy_fs_path({'blocks': [{'x': 1}], 'internal_path': '/internal-storage/a'}))
+        self.assertIsNotNone(_legacy_fs_path({'internal_path': '/internal-storage/a'}))
