@@ -248,3 +248,89 @@ class InitialAdminSeedTests(TestCase):
             admin = self._seed()
         self.assertFalse(admin.check_password('admin'))
         self.assertIn('generated password', buf.getvalue())
+
+
+class AdminRequirePasswordChangeTests(TestCase):
+    def setUp(self):
+        cache.clear()
+        User.objects.create_superuser('boss3', 'b3@example.com', 'Boss-Pass-4455!')
+        self.access = self.client.post(
+            '/api/v1/auth/login', {'username': 'boss3', 'password': 'Boss-Pass-4455!'},
+            content_type=JSON).json()['access']
+        self.target = User.objects.create_user('dave', password='Dave-Pass-1234!')
+
+    def _put(self, body):
+        return self.client.put(
+            f'/api/v1/system/user/{self.target.id}/', body, content_type=JSON,
+            HTTP_AUTHORIZATION=f'Bearer {self.access}')
+
+    def test_flagging_gates_login_and_revokes_sessions(self):
+        refresh = mfa_api._mint_jwt_pair(self.target)['refresh']
+        resp = self._put({'require_password_change': True})
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertTrue(resp.json()['password_change_required'])
+        login = self.client.post(
+            '/api/v1/auth/login', {'username': 'dave', 'password': 'Dave-Pass-1234!'},
+            content_type=JSON).json()
+        self.assertTrue(login['password_change_required'])
+        self.assertIsNone(login['access'])
+        refreshed = self.client.post(
+            '/api/v1/auth/token/refresh', {'refresh': refresh}, content_type=JSON)
+        self.assertEqual(refreshed.status_code, 401)
+
+    def test_unflagging_restores_normal_login(self):
+        self._put({'require_password_change': True})
+        self._put({'require_password_change': False})
+        self.assertFalse(password_change_required(self.target))
+
+    def test_temporary_password_with_required_change_in_one_request(self):
+        self._put({'password': 'Temp-Pass-8877!', 'require_password_change': True})
+        self.assertTrue(password_change_required(self.target))
+        login = self.client.post(
+            '/api/v1/auth/login', {'username': 'dave', 'password': 'Temp-Pass-8877!'},
+            content_type=JSON).json()
+        self.assertTrue(login['password_change_required'])
+
+    def test_unrelated_edit_keeps_existing_flag_and_sessions(self):
+        self._put({'require_password_change': True})
+        refresh = mfa_api._mint_jwt_pair(self.target)['refresh']
+        self._put({'email': 'd@example.com', 'require_password_change': True})
+        self.assertTrue(password_change_required(self.target))
+        refreshed = self.client.post(
+            '/api/v1/auth/token/refresh', {'refresh': refresh}, content_type=JSON)
+        self.assertEqual(refreshed.status_code, 200)
+
+    def test_non_superuser_cannot_flag(self):
+        plain = mfa_api._mint_jwt_pair(self.target)['access']
+        resp = self.client.put(
+            f'/api/v1/system/user/{self.target.id}/', {'require_password_change': True},
+            content_type=JSON, HTTP_AUTHORIZATION=f'Bearer {plain}')
+        self.assertIn(resp.status_code, (401, 403))
+        self.assertFalse(password_change_required(self.target))
+
+
+class Migration0006FlaggingTests(TestCase):
+    def _run(self, user):
+        from importlib import import_module
+
+        from django.apps import apps as django_apps
+        PasswordChangeRequired.objects.all().delete()
+        import_module('p2.core.migrations.0006_passwordchangerequired').flag_default_admin(
+            django_apps, None)
+        return password_change_required(user)
+
+    def test_admin_with_default_password_is_flagged(self):
+        admin = User.objects.get(username='admin')
+        admin.set_password('admin')
+        admin.save()
+        self.assertTrue(self._run(admin))
+
+    def test_admin_with_chosen_password_is_not_flagged(self):
+        admin = User.objects.get(username='admin')
+        admin.set_password('Chosen-By-Operator-77!')
+        admin.save()
+        self.assertFalse(self._run(admin))
+
+    def test_other_users_with_password_admin_are_not_flagged(self):
+        other = User.objects.create_user('someone', password='admin')
+        self.assertFalse(self._run(other))

@@ -190,6 +190,7 @@ const editUserEmail = ref('')
 const editUserPassword = ref('')
 const editUserIsActive = ref(true)
 const editUserIsAdmin = ref(false)
+const editUserRequireChange = ref(false)
 const editUserGroups = ref('')
 const userUpdating = ref(false)
 
@@ -199,6 +200,7 @@ function openEditUser(u) {
   editUserPassword.value = ''
   editUserIsActive.value = u.is_active !== undefined ? u.is_active : true
   editUserIsAdmin.value = !!u.is_superuser
+  editUserRequireChange.value = !!u.password_change_required
   editUserGroups.value = (u.groups || []).join(', ')
   showEditUserDialog.value = true
 }
@@ -211,6 +213,7 @@ async function handleUpdateUser(close) {
       email: editUserEmail.value.trim(),
       is_active: editUserIsActive.value,
       is_superuser: editUserIsAdmin.value,
+      require_password_change: editUserRequireChange.value,
       groups: editUserGroups.value.split(',').map(s => s.trim()).filter(Boolean),
     }
     if (editUserPassword.value.trim()) {
@@ -664,6 +667,7 @@ async function handleDisableMfa(close) {
                   <p class="text-sm font-medium text-ink-gray-9">{{ u.username }}</p>
                   <Badge :label="u.is_superuser ? 'Admin' : 'User'" :theme="u.is_superuser ? 'red' : 'gray'" variant="subtle" size="sm" />
                   <Badge :label="u.is_active ? 'Active' : 'Inactive'" :theme="u.is_active ? 'green' : 'orange'" variant="subtle" size="sm" />
+                  <Badge v-if="u.password_change_required" label="Must change password" theme="orange" variant="subtle" size="sm" />
                 </div>
                 <p class="text-xs text-ink-gray-5">
                   {{ u.email || 'No email' }}
@@ -1181,6 +1185,11 @@ async function handleDisableMfa(close) {
               label="Superuser (admin)"
             />
           </div>
+          <FormControl
+            v-model="editUserRequireChange"
+            type="checkbox"
+            label="Require a password change at next sign-in (signs the user out now)"
+          />
         </div>
       </template>
       <template #actions="{ close }">

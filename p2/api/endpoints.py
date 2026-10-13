@@ -83,6 +83,15 @@ def update_user(request, user_id: int, payload: UserUpdateSchema):
         # An admin deliberately choosing a password replaces the default one.
         PasswordChangeRequired.objects.filter(user=target).delete()
     target.save()
+    if payload.require_password_change is True:
+        # Applied after the password step so "set a temporary password and
+        # require a change" works in one request.
+        _, newly_flagged = PasswordChangeRequired.objects.get_or_create(
+            user=target, defaults={'reason': 'admin_required'})
+        if newly_flagged:
+            _revoke_refresh_tokens(target)
+    elif payload.require_password_change is False:
+        PasswordChangeRequired.objects.filter(user=target).delete()
     if payload.password or payload.is_active is False:
         # Cut off sessions that predate the reset or deactivation.
         _revoke_refresh_tokens(target)
