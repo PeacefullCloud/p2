@@ -83,6 +83,15 @@ docker compose down
 docker compose logs -f web
 ```
 
+### First sign-in
+
+The first migration creates a superuser named `admin`. Set `P2_ADMIN_PASSWORD`
+in `.env` before the first start to choose its password. If it is unset, a
+random password is generated and printed once to the migration output (for
+Docker, `docker compose logs`). Installs created by older versions still have
+`admin`/`admin`; that account is forced to set a new password at its next
+sign-in.
+
 ## Limitations
 
 - **Not production-ready.** This is an MVP/work in progress; configuration and

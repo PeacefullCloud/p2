@@ -167,3 +167,84 @@ class SessionRevocationAndLoginRouteTests(TestCase):
             django_apps, None)
         self.assertEqual(BlacklistedToken.objects.filter(token__user=user).count(), 1)
         self.assertEqual(BlacklistedToken.objects.filter(token__user=other).count(), 0)
+
+
+class SelfServicePasswordChangeTests(TestCase):
+    PW = 'Current-Pass-5566!'
+
+    def setUp(self):
+        cache.clear()
+        self.user = User.objects.create_user('carol', password=self.PW)
+        pair = mfa_api._mint_jwt_pair(self.user)
+        self.access, self.old_refresh = pair['access'], pair['refresh']
+
+    def _change(self, current, new, access=None):
+        headers = {'HTTP_AUTHORIZATION': f'Bearer {access or self.access}'}
+        return self.client.post(
+            '/api/v1/auth/change-password',
+            {'current_password': current, 'new_password': new}, content_type=JSON, **headers)
+
+    def test_requires_authentication(self):
+        resp = self.client.post(
+            '/api/v1/auth/change-password',
+            {'current_password': self.PW, 'new_password': NEW_PW}, content_type=JSON)
+        self.assertEqual(resp.status_code, 401)
+
+    def test_change_returns_fresh_tokens_and_revokes_old_refresh(self):
+        resp = self._change(self.PW, NEW_PW)
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertTrue(resp.json()['access'])
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.check_password(NEW_PW))
+        old = self.client.post(
+            '/api/v1/auth/token/refresh', {'refresh': self.old_refresh}, content_type=JSON)
+        self.assertEqual(old.status_code, 401)
+        new = self.client.post(
+            '/api/v1/auth/token/refresh', {'refresh': resp.json()['refresh']}, content_type=JSON)
+        self.assertEqual(new.status_code, 200)
+
+    def test_wrong_current_password_rejected_and_throttled(self):
+        for _ in range(5):
+            self.assertEqual(self._change('wrong', NEW_PW).status_code, 400)
+        self.assertEqual(self._change(self.PW, NEW_PW).status_code, 429)
+
+    def test_weak_or_unchanged_password_rejected(self):
+        self.assertEqual(self._change(self.PW, self.PW).status_code, 400)
+        self.assertEqual(self._change(self.PW, '123').status_code, 400)
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.check_password(self.PW))
+
+    def test_sso_only_account_has_nothing_to_change(self):
+        self.user.set_unusable_password()
+        self.user.save()
+        self.assertEqual(self._change('anything', NEW_PW).status_code, 400)
+
+
+class InitialAdminSeedTests(TestCase):
+    def _seed(self, **env):
+        import os
+        from importlib import import_module
+        from unittest import mock
+
+        from django.apps import apps as django_apps
+
+        User.objects.filter(username='admin').delete()
+        mod = import_module('p2.core.migrations.0002_default_admin')
+        with mock.patch.dict(os.environ, env, clear=False):
+            if not env:
+                os.environ.pop('P2_ADMIN_PASSWORD', None)
+            mod.create_default_admin(django_apps, None)
+        return User.objects.get(username='admin')
+
+    def test_env_password_is_used(self):
+        admin = self._seed(P2_ADMIN_PASSWORD='Chosen-By-Operator-77!')
+        self.assertTrue(admin.check_password('Chosen-By-Operator-77!'))
+
+    def test_without_env_a_random_password_is_generated(self):
+        import io
+        from contextlib import redirect_stderr
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            admin = self._seed()
+        self.assertFalse(admin.check_password('admin'))
+        self.assertIn('generated password', buf.getvalue())

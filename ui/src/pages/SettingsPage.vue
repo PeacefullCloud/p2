@@ -9,7 +9,7 @@ const {
   apiKeys, keysLoading, createApiKey, keyCreating, deleteApiKey,
   users, usersLoading, createUser, userCreating, updateUser, deleteUser,
   policies, policiesLoading, createPolicy, updatePolicy, deletePolicy,
-  mfaEnabled, mfaStatusLoading, setupMfa, mfaSettingUp, confirmMfa, mfaConfirming, disableMfa, mfaDisabling,
+  mfaEnabled, mfaStatusLoading, setupMfa, mfaSettingUp, confirmMfa, mfaConfirming, disableMfa, mfaDisabling, changeOwnPassword,
   authPolicies, authPoliciesLoading, fetchAuthPolicies, createAuthPolicy, updateAuthPolicy, deleteAuthPolicy, getAffectedCount,
   groups, groupsLoading, fetchGroups,
   ssoProviders, ssoProvidersLoading, fetchSsoProviders, availableProviders, createSsoProvider, updateSsoProvider, deleteSsoProvider,
@@ -548,6 +548,27 @@ async function handleConfirmMfa() {
   }
 }
 
+const pwForm = ref({ current: '', next: '', confirm: '' })
+const pwChanging = ref(false)
+
+async function handleChangePassword() {
+  const { current, next, confirm } = pwForm.value
+  if (next !== confirm) {
+    toast.error('The two new passwords do not match')
+    return
+  }
+  pwChanging.value = true
+  try {
+    await changeOwnPassword(current, next)
+    pwForm.value = { current: '', next: '', confirm: '' }
+    toast.success('Password changed. Other sessions were signed out.')
+  } catch (e) {
+    toast.error(e.message || 'Could not change the password')
+  } finally {
+    pwChanging.value = false
+  }
+}
+
 const showMfaDisableDialog = ref(false)
 const mfaDisablePassword = ref('')
 
@@ -691,6 +712,23 @@ async function handleDisableMfa(close) {
               />
             </div>
           </div>
+        </div>
+
+        <!-- ═══ Change password ═══ -->
+        <div v-if="activeTab === 'security'" class="mt-8 space-y-4">
+          <h2 class="text-base font-medium text-ink-gray-8">Change Password</h2>
+          <p class="text-p-sm text-ink-gray-5">
+            Changing your password signs you out everywhere else.
+          </p>
+          <form
+            class="max-w-sm space-y-3 rounded-md border border-outline-gray-1 bg-surface-white p-4"
+            @submit.prevent="handleChangePassword"
+          >
+            <FormControl v-model="pwForm.current" type="password" label="Current password" autocomplete="current-password" required />
+            <FormControl v-model="pwForm.next" type="password" label="New password" autocomplete="new-password" required />
+            <FormControl v-model="pwForm.confirm" type="password" label="Confirm new password" autocomplete="new-password" required />
+            <Button variant="solid" theme="gray" type="submit" label="Change password" :loading="pwChanging" />
+          </form>
         </div>
 
         <!-- ═══ Login Policy ═══ -->

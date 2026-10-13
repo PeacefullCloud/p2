@@ -1,4 +1,4 @@
-import { useApi, getUser } from './api'
+import { useApi, getUser, saveTokens } from './api'
 import { computed, ref, watch } from 'vue'
 
 // ── Shared config ────────────────────────────────────────────────────────
@@ -259,6 +259,22 @@ export function useSettings() {
     await fetchMfaStatus()
   }
 
+  // Self-service password change. The server revokes every other session and
+  // returns a fresh token pair so this browser stays signed in.
+  async function changeOwnPassword(currentPassword, newPassword) {
+    const resp = await fetch('/api/v1/auth/change-password', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${localStorage.getItem('p2_token') || ''}`,
+      },
+      body: JSON.stringify({ current_password: currentPassword, new_password: newPassword }),
+    })
+    const body = await resp.json().catch(() => ({}))
+    if (!resp.ok) throw new Error(body.detail || `HTTP ${resp.status}`)
+    saveTokens(body.access, body.refresh)
+  }
+
   // ── Auth Policies ────────────────────────────────────────────────────────
   const { data: authPoliciesData, isFetching: authPoliciesLoading, execute: fetchAuthPolicies } = useApi(
     '/system/auth-policy/',
@@ -498,6 +514,7 @@ export function useSettings() {
     mfaConfirming,
     disableMfa,
     mfaDisabling,
+    changeOwnPassword,
     // Auth Policies
     authPolicies: authPoliciesList,
     authPoliciesLoading,

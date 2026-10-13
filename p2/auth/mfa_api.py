@@ -96,6 +96,16 @@ class PasswordChangeSchema(Schema):
     new_password: str
 
 
+class ChangePasswordSchema(Schema):
+    current_password: str
+    new_password: str
+
+
+class TokenPairSchema(Schema):
+    access: str
+    refresh: str
+
+
 class MfaVerifySchema(Schema):
     mfa_token: str
     code: str
@@ -161,6 +171,41 @@ def current_user(request):
     )
 
 
+@router_login.post('/change-password', response=TokenPairSchema)
+def change_password(request, payload: ChangePasswordSchema):
+    """Self-service password change for a signed-in user.
+
+    Requires the current password, so a stolen access token alone cannot take
+    the account over. Every other session is revoked and a fresh token pair
+    is returned so this browser stays signed in.
+    """
+    from django.contrib.auth.password_validation import validate_password
+    from django.core.exceptions import ValidationError
+
+    user = request.user
+    if not getattr(user, 'is_authenticated', False):
+        raise HttpError(401, "Not authenticated")
+    if _throttled('change-pw-user', str(user.pk), _CHANGE_PW_FAILS_PER_USER):
+        raise HttpError(429, "Too many incorrect passwords. Try again later.")
+    if not user.has_usable_password():
+        raise HttpError(400, "This account signs in with SSO and has no password to change.")
+    if not user.check_password(payload.current_password):
+        _record_failure('change-pw-user', str(user.pk))
+        raise HttpError(400, "Current password is incorrect.")
+    _clear_failures('change-pw-user', str(user.pk))
+    if payload.current_password == payload.new_password:
+        raise HttpError(400, "The new password must be different from the current one.")
+    try:
+        validate_password(payload.new_password, user)
+    except ValidationError as exc:
+        raise HttpError(400, ' '.join(exc.messages))
+
+    user.set_password(payload.new_password)
+    user.save(update_fields=['password'])
+    _revoke_refresh_tokens(user)
+    return TokenPairSchema(**_mint_jwt_pair(user))
+
+
 def _issue_mfa_challenge(user) -> str:
     """Create a single-use, short-lived token binding this login attempt to
     `user`, so /mfa/verify doesn't need the password again."""
@@ -206,6 +251,7 @@ _LOGIN_FAILS_PER_ACCOUNT = 50
 _LOGIN_FAILS_PER_IP = 100
 _MFA_FAILS_PER_USER = 10
 _DISABLE_FAILS_PER_USER = 5
+_CHANGE_PW_FAILS_PER_USER = 5
 
 
 def _client_ip(request) -> str:
