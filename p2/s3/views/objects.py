@@ -50,7 +50,7 @@ from p2.s3.utils import decode_aws_chunked, iter_request_body
 from p2.s3.cache import (
     get_cached_metadata, set_cached_metadata, invalidate_metadata, invalidate_volume_global,
 )
-from p2.s3.fastpath import hash_put_body
+from p2.s3.fastpath import hash_put_body, put_user_metadata, user_metadata_headers
 from p2.s3.volume_pool import BlockCoord, VolumePool
 from p2.s3.volume_reader import (
     read_object, read_range, slice_blocks, stream_blocks, stream_sliced_blocks, total_size,
@@ -311,6 +311,8 @@ class ObjectView(S3View):
         if etag:
             response["ETag"] = f'"{etag}"'
         response["Accept-Ranges"] = "bytes"
+        for name, value in user_metadata_headers(meta):
+            response[name] = value
         return await self._apply_cors(request, response, volume)
 
     # ── GET ───────────────────────────────────────────────────────────────
@@ -399,6 +401,8 @@ class ObjectView(S3View):
             response["Last-Modified"] = lm
         response["ETag"] = f'"{etag}"' if etag else ""
         response["Accept-Ranges"] = "bytes"
+        for name, value in user_metadata_headers(meta):
+            response[name] = value
         if "response-content-type" in request.GET:
             response["Content-Type"] = request.GET["response-content-type"]
         if "response-content-disposition" in request.GET:
@@ -449,6 +453,8 @@ class ObjectView(S3View):
         response["Content-Length"] = length
         response["Content-Range"] = f"bytes {start}-{end}/{obj_size}"
         response["Accept-Ranges"] = "bytes"
+        for name, value in user_metadata_headers(meta):
+            response[name] = value
         if etag:
             response["ETag"] = f'"{etag}"'
         lm = _fmt_http_date(_meta_mtime(meta))
@@ -481,6 +487,7 @@ class ObjectView(S3View):
         pool = VolumePool.get()
 
         client_ct = request.META.get("CONTENT_TYPE", "application/octet-stream")
+        user_metadata = put_user_metadata(request.headers)
         content_encoding = request.META.get("HTTP_CONTENT_ENCODING", "")
         decoded_length = request.META.get("HTTP_X_AMZ_DECODED_CONTENT_LENGTH")
         is_aws_chunked = "aws-chunked" in content_encoding or decoded_length
@@ -561,6 +568,8 @@ class ObjectView(S3View):
         }
         if new_version_id:
             metadata_payload["version_id"] = new_version_id
+        if user_metadata:
+            metadata_payload["user_metadata"] = user_metadata
         metadata_json = json.dumps(metadata_payload)
 
         # ── Group-commit: write data + metadata atomically ────────────────
@@ -659,6 +668,9 @@ class ObjectView(S3View):
 
     async def _copy_object(self, request, dest_bucket, dest_path, copy_source):
         import urllib.parse
+        replacement_metadata = None
+        if request.META.get("HTTP_X_AMZ_METADATA_DIRECTIVE", "COPY") == "REPLACE":
+            replacement_metadata = put_user_metadata(request.headers)
         try:
             copy_source = urllib.parse.unquote(copy_source).lstrip("/")
             parts = copy_source.split("/", 1)
@@ -680,6 +692,8 @@ class ObjectView(S3View):
             dest_meta = dict(src_meta)
             dest_meta["mtime"] = str(now())
             dest_meta["ctime"] = str(now())
+            if replacement_metadata is not None:
+                dest_meta["user_metadata"] = replacement_metadata
 
             existing_raw = await asyncio.to_thread(dest_engine.get, dest_path)
             existing_size = 0

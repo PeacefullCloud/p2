@@ -9,8 +9,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import json
-from collections import defaultdict
 from dataclasses import dataclass
+from time import perf_counter
 from typing import TYPE_CHECKING, Union, Dict, Any
 
 from django.conf import settings
@@ -48,6 +48,8 @@ class WriteJob:
     lmdb_key: str
     metadata_json: Union[str, Dict[str, Any]]
     completion: asyncio.Future[bool]
+    timings: dict[str, float] | None = None
+    submitted_at: float = 0.0
 
 
 def _queue_max_size() -> int:
@@ -154,11 +156,18 @@ def _write_and_commit_batch(batch: list[WriteJob], resolve) -> None:
     both writes landed in the same batching window
     (see docs/milliscale_optimization_plan.md, #1).
     """
+    measured = any(job.timings is not None for job in batch)
+    started = perf_counter() if measured else 0.0
+    if measured:
+        for job in batch:
+            if job.timings is not None:
+                job.timings["write_queue"] = (started - job.submitted_at) * 1000
     write_jobs = [job for job in batch if job.data]
     if write_jobs:
-        p2_s3_crypto.write_blocks_uring(
+        p2_s3_crypto.write_blocks_shared(
             [(job.handle.fd, job.offset, job.data) for job in write_jobs]
         )
+        written = perf_counter() if measured else 0.0
 
         # One fdatasync per unique volume fd touched by this batch, issued
         # once data is on disk and before any metadata commit references it.
@@ -166,12 +175,20 @@ def _write_and_commit_batch(batch: list[WriteJob], resolve) -> None:
         # per write, and keeps the write-ahead ordering (data durable before
         # metadata says it exists) intact for every engine below.
         if getattr(settings, "S3_VOLUME_FDATASYNC", True):
-            synced_fds: set[int] = set()
+            synced_volumes: set[str] = set()
             for job in write_jobs:
-                fd = job.handle.fd
-                if fd not in synced_fds:
-                    p2_s3_crypto.fdatasync_uring(fd)
-                    synced_fds.add(fd)
+                # Allocations own distinct descriptor leases, even when they
+                # target the same volume file. Sync that file only once.
+                volume_id = job.handle.uuid_hex
+                if volume_id not in synced_volumes:
+                    p2_s3_crypto.fdatasync_uring(job.handle.fd)
+                    synced_volumes.add(volume_id)
+        if measured:
+            synced = perf_counter()
+            for job in batch:
+                if job.timings is not None:
+                    job.timings["data_write"] = (written - started) * 1000
+                    job.timings["data_sync"] = (synced - written) * 1000
 
     by_engine: dict[int, tuple[object, list[WriteJob]]] = {}
     for job in batch:
@@ -186,9 +203,17 @@ def _write_and_commit_batch(batch: list[WriteJob], resolve) -> None:
                 meta_str = json.dumps(job.metadata_json) if isinstance(job.metadata_json, dict) else job.metadata_json
                 serialized_jobs.append((job.lmdb_key.encode("utf-8"), meta_str.encode("utf-8")))
 
+            lock_started = perf_counter() if measured else 0.0
             with engine.env.begin(write=True, db=engine.db) as txn:
+                lock_acquired = perf_counter() if measured else 0.0
                 for key, val in serialized_jobs:
                     txn.put(key, val)
+            if measured:
+                committed = perf_counter()
+                for job in jobs:
+                    if job.timings is not None:
+                        job.timings["metadata_lock"] = (lock_acquired - lock_started) * 1000
+                        job.timings["metadata_commit"] = (committed - lock_acquired) * 1000
         except Exception as exc:  # noqa: BLE001 - isolate failure to this engine's jobs only
             logger.exception("LMDB commit failed for engine batch of %d objects", len(jobs))
             for job in jobs:
@@ -259,18 +284,33 @@ async def write_block(
     lmdb_key: str,
     metadata_json: Union[str, Dict[str, Any]],
     md5_hash: bytes | None = None,
+    *,
+    timings: dict[str, float] | None = None,
 ) -> bool:
     """Queue a write and wait until its data and metadata are both visible."""
     del md5_hash
     loop = asyncio.get_running_loop()
     queue = await _ensure_batch_worker()
     completion: asyncio.Future[bool] = loop.create_future()
-    job = WriteJob(handle, offset, data, engine, lmdb_key, metadata_json, completion)
+    job = WriteJob(
+        handle, offset, data, engine, lmdb_key, metadata_json, completion,
+        timings, perf_counter() if timings is not None else 0.0,
+    )
 
     # Awaiting bounded queue capacity applies backpressure rather than growing
     # memory without limit when clients exceed storage service capacity.
     await queue.put(job)
     return await completion
+
+
+async def shutdown_writer() -> None:
+    """Drain accepted writes before the RSGI worker loop closes."""
+    if _STATE_LOOP is not asyncio.get_running_loop() or _WORKER is None:
+        return
+    if _QUEUE is not None and not _WORKER.done():
+        await _QUEUE.join()
+    _WORKER.cancel()
+    await asyncio.gather(_WORKER, return_exceptions=True)
 
 
 def _direct_write(

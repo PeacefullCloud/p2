@@ -19,6 +19,9 @@ const editBucketRef = ref(null)
 const editVersioning = ref(false)
 const editEncryption = ref('AES-256')
 const editAccessPolicy = ref('private')
+const editCorsRules = ref([])
+
+const corsMethodOptions = ['GET', 'PUT', 'POST', 'DELETE', 'HEAD']
 
 watch(showCreate, (val) => {
   if (val) {
@@ -62,16 +65,69 @@ function openEditBucket(bucket) {
   editVersioning.value = bucket.versioning
   editEncryption.value = bucket.encryption
   editAccessPolicy.value = bucket.accessPolicy
+  editCorsRules.value = (bucket.corsRules || []).map(r => ({
+    origins: (r.AllowedOrigins || []).join(', '),
+    methods: Array.isArray(r.AllowedMethods) ? [...r.AllowedMethods] : ['GET', 'HEAD'],
+    allowedHeaders: (r.AllowedHeaders || []).join(', '),
+    exposeHeaders: (r.ExposeHeaders || []).join(', '),
+    maxAgeSeconds: r.MaxAgeSeconds ?? 3600,
+  }))
   showEdit.value = true
+}
+
+function addCorsRule() {
+  editCorsRules.value.push({
+    origins: '',
+    methods: ['GET', 'HEAD'],
+    allowedHeaders: '*',
+    exposeHeaders: 'ETag',
+    maxAgeSeconds: 3600,
+  })
+}
+
+function removeCorsRule(index) {
+  editCorsRules.value.splice(index, 1)
+}
+
+function splitCsv(val) {
+  return String(val || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean)
 }
 
 async function handleUpdate(close) {
   if (!editBucketRef.value) return
+  const corsRules = []
+  for (let i = 0; i < editCorsRules.value.length; i++) {
+    const r = editCorsRules.value[i]
+    const origins = splitCsv(r.origins)
+    const methods = (r.methods || []).filter(Boolean)
+    if (!origins.length) {
+      toast.error(`CORS Rule #${i + 1}: specify at least one allowed origin`)
+      return
+    }
+    if (!methods.length) {
+      toast.error(`CORS Rule #${i + 1}: select at least one allowed method`)
+      return
+    }
+    const maxAge = r.maxAgeSeconds !== '' && r.maxAgeSeconds !== null && r.maxAgeSeconds !== undefined
+      ? Number(r.maxAgeSeconds)
+      : null
+    corsRules.push({
+      AllowedOrigins: origins,
+      AllowedMethods: methods,
+      AllowedHeaders: splitCsv(r.allowedHeaders),
+      ExposeHeaders: splitCsv(r.exposeHeaders),
+      MaxAgeSeconds: Number.isFinite(maxAge) && maxAge >= 0 ? Math.floor(maxAge) : null,
+    })
+  }
   try {
     await updateBucket(editBucketRef.value.uuid, {
       versioning: editVersioning.value,
       encryption: editEncryption.value,
       accessPolicy: editAccessPolicy.value,
+      corsRules,
     })
     toast.success(`Bucket "${editBucketRef.value.name}" settings updated`)
     close()
@@ -284,11 +340,12 @@ function promptRevokeAcl(acl) {
             </div>
           </button>
           <div class="flex items-center gap-2 shrink-0">
+            <Badge v-if="b.corsRules?.length" label="CORS" theme="green" variant="subtle" size="sm" />
             <Badge v-if="b.versioning" label="Versioned" theme="blue" variant="subtle" size="sm" />
             <Badge :label="b.accessPolicy" :theme="accessTheme(b.accessPolicy)" variant="subtle" size="sm" />
             <Badge :label="b.encryption" theme="gray" variant="subtle" size="sm" />
             <Button v-if="b.canAdmin" icon="shield" variant="ghost" theme="gray" size="sm" title="Bucket Permissions" @click.stop="openAclDialog(b)" />
-            <Button v-if="b.canAdmin" icon="settings" variant="ghost" theme="gray" size="sm" @click.stop="openEditBucket(b)" />
+            <Button v-if="b.canAdmin" icon="settings" variant="ghost" theme="gray" size="sm" title="Bucket Settings & CORS" @click.stop="openEditBucket(b)" />
             <Button v-if="b.canAdmin" icon="trash-2" variant="ghost" theme="red" size="sm" @click.stop="promptDeleteBucket(b)" />
             <Button icon="chevron-right" variant="ghost" size="sm" @click="openBucket(b)" />
           </div>
@@ -380,11 +437,11 @@ function promptRevokeAcl(acl) {
       :options="{
         title: 'Bucket Settings',
         icon: { name: 'settings' },
-        size: 'lg',
+        size: 'xl',
       }"
     >
       <template #body-content>
-        <div class="space-y-4" @pointerdown.stop>
+        <div class="space-y-4 max-h-[70vh] overflow-y-auto pr-1" @pointerdown.stop>
           <FormControl
             :modelValue="editBucketRef?.name"
             label="Bucket Name"
@@ -392,23 +449,137 @@ function promptRevokeAcl(acl) {
             disabled
             description="Bucket name cannot be modified after creation."
           />
-          <FormControl
-            v-model="editEncryption"
-            label="Encryption"
-            type="select"
-            :options="encryptionOptions"
-          />
-          <FormControl
-            v-model="editAccessPolicy"
-            label="Access Policy"
-            type="select"
-            :options="accessOptions"
-          />
+          <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
+            <FormControl
+              v-model="editEncryption"
+              label="Encryption"
+              type="select"
+              :options="encryptionOptions"
+            />
+            <FormControl
+              v-model="editAccessPolicy"
+              label="Access Policy"
+              type="select"
+              :options="accessOptions"
+            />
+          </div>
           <FormControl
             v-model="editVersioning"
             type="checkbox"
             label="Enable Versioning"
           />
+
+          <!-- CORS Rules Section -->
+          <div class="border-t border-outline-gray-1 pt-4 space-y-3">
+            <div class="flex items-start justify-between gap-3">
+              <div>
+                <h4 class="text-sm font-medium text-ink-gray-9">Cross-Origin Resource Sharing (CORS)</h4>
+                <p class="text-xs text-ink-gray-5 mt-0.5">
+                  Allow web applications from other origins to make S3 requests to this bucket. CORS does not grant bucket access permissions.
+                </p>
+              </div>
+              <Button
+                size="sm"
+                variant="subtle"
+                theme="gray"
+                icon-left="plus"
+                label="Add Rule"
+                class="shrink-0"
+                @click="addCorsRule"
+              />
+            </div>
+
+            <div v-if="editCorsRules.length" class="space-y-3">
+              <div
+                v-for="(rule, idx) in editCorsRules"
+                :key="idx"
+                class="rounded-md border border-outline-gray-1 bg-surface-gray-1 p-3 space-y-3"
+              >
+                <div class="flex items-center justify-between">
+                  <span class="text-xs font-semibold uppercase tracking-wide text-ink-gray-6">
+                    Rule #{{ idx + 1 }}
+                  </span>
+                  <Button
+                    icon="trash-2"
+                    variant="ghost"
+                    theme="red"
+                    size="sm"
+                    title="Remove rule"
+                    @click="removeCorsRule(idx)"
+                  />
+                </div>
+
+                <div>
+                  <label class="block text-xs font-medium text-ink-gray-6 mb-1">
+                    Allowed Origins <span class="text-red-500">*</span>
+                  </label>
+                  <input
+                    v-model="rule.origins"
+                    type="text"
+                    placeholder="https://app.example.com, *"
+                    class="w-full rounded-md border border-outline-gray-1 bg-surface-white px-3 py-1.5 text-sm text-ink-gray-9 focus:border-gray-900 focus:outline-none"
+                  />
+                  <p class="text-[11px] text-ink-gray-5 mt-1">
+                    Comma-separated origins. Wildcards like <code>*</code> or <code>https://*.example.com</code> are supported.
+                  </p>
+                </div>
+
+                <div>
+                  <label class="block text-xs font-medium text-ink-gray-6 mb-1.5">
+                    Allowed Methods <span class="text-red-500">*</span>
+                  </label>
+                  <div class="flex flex-wrap gap-4">
+                    <label
+                      v-for="m in corsMethodOptions"
+                      :key="m"
+                      class="flex items-center gap-1.5 text-xs font-medium text-ink-gray-8 cursor-pointer"
+                    >
+                      <input type="checkbox" :value="m" v-model="rule.methods" class="rounded text-gray-900" />
+                      <span>{{ m }}</span>
+                    </label>
+                  </div>
+                </div>
+
+                <div class="grid grid-cols-1 gap-3 sm:grid-cols-3">
+                  <div>
+                    <label class="block text-xs font-medium text-ink-gray-6 mb-1">Allowed Headers</label>
+                    <input
+                      v-model="rule.allowedHeaders"
+                      type="text"
+                      placeholder="*, Authorization"
+                      class="w-full rounded-md border border-outline-gray-1 bg-surface-white px-3 py-1.5 text-sm text-ink-gray-9 focus:border-gray-900 focus:outline-none"
+                    />
+                  </div>
+                  <div>
+                    <label class="block text-xs font-medium text-ink-gray-6 mb-1">Expose Headers</label>
+                    <input
+                      v-model="rule.exposeHeaders"
+                      type="text"
+                      placeholder="ETag, x-amz-request-id"
+                      class="w-full rounded-md border border-outline-gray-1 bg-surface-white px-3 py-1.5 text-sm text-ink-gray-9 focus:border-gray-900 focus:outline-none"
+                    />
+                  </div>
+                  <div>
+                    <label class="block text-xs font-medium text-ink-gray-6 mb-1">Max Age (seconds)</label>
+                    <input
+                      v-model="rule.maxAgeSeconds"
+                      type="number"
+                      min="0"
+                      placeholder="3600"
+                      class="w-full rounded-md border border-outline-gray-1 bg-surface-white px-3 py-1.5 text-sm text-ink-gray-9 focus:border-gray-900 focus:outline-none"
+                    />
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div
+              v-else
+              class="rounded-md border border-dashed border-outline-gray-1 py-4 text-center text-xs text-ink-gray-5"
+            >
+              No CORS rules configured for this bucket.
+            </div>
+          </div>
         </div>
       </template>
 

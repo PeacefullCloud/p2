@@ -491,3 +491,69 @@ class PresignAuthorizationTests(TestCase):
         )
         self.assertEqual(resp.status_code, 404)
 
+
+class BucketCorsApiTests(TestCase):
+    """Volume update endpoint persists and clears S3 CORS rules for bucket admins."""
+
+    def setUp(self):
+        self.client = Client()
+        self.owner = User.objects.create_user(username="corsowner", password="ownerpassword123")
+        self.reader = User.objects.create_user(username="corsreader", password="readerpassword123")
+        self.storage = get_test_storage()
+        self.vol = Volume.objects.create(name="cors-ui-bucket", storage=self.storage)
+        VolumeACL.objects.create(
+            volume=self.vol, user=self.owner,
+            permissions=["read", "write", "delete", "list", "admin"],
+        )
+        VolumeACL.objects.create(
+            volume=self.vol, user=self.reader,
+            permissions=["read", "list"],
+        )
+        self.owner_headers = _login(self.client, "corsowner", "ownerpassword123")
+        self.reader_headers = _login(self.client, "corsreader", "readerpassword123")
+
+    def test_admin_can_set_and_clear_cors_rules(self):
+        rules = [
+            {
+                "AllowedOrigins": ["https://app.example.com"],
+                "AllowedMethods": ["GET", "PUT"],
+                "AllowedHeaders": ["*"],
+                "ExposeHeaders": ["ETag"],
+                "MaxAgeSeconds": 3600,
+            }
+        ]
+        resp = self.client.put(
+            f"/api/v1/core/volume/{self.vol.uuid}/",
+            data=json.dumps({"cors_rules": rules}),
+            content_type="application/json",
+            **self.owner_headers,
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.vol.refresh_from_db()
+        self.assertEqual(self.vol.tags.get("s3.p2.io/cors/rules"), rules)
+
+        # Clear rules
+        resp = self.client.put(
+            f"/api/v1/core/volume/{self.vol.uuid}/",
+            data=json.dumps({"cors_rules": []}),
+            content_type="application/json",
+            **self.owner_headers,
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.vol.refresh_from_db()
+        self.assertNotIn("s3.p2.io/cors/rules", self.vol.tags)
+
+    def test_non_admin_cannot_update_cors_rules(self):
+        resp = self.client.put(
+            f"/api/v1/core/volume/{self.vol.uuid}/",
+            data=json.dumps({
+                "cors_rules": [
+                    {"AllowedOrigins": ["*"], "AllowedMethods": ["GET"]}
+                ]
+            }),
+            content_type="application/json",
+            **self.reader_headers,
+        )
+        self.assertEqual(resp.status_code, 403)
+
+

@@ -84,18 +84,14 @@ S3_EVENT_QUEUE_FLUSH_MS = int(CONFIG.y("s3.event_queue.flush_ms", default=5))
 S3_EVENT_QUEUE_WAIT_FOR_ACK = CONFIG.y_bool("s3.event_queue.wait_for_ack", default=False)
 S3_BLOB_SHARD_DEPTH = max(1, min(2, int(CONFIG.y("s3.blob.shard_depth", default=2))))
 # LMDB metadata durability knobs.
-# Default is NON-fsyncing (sync/metasync False): every PUT already issues one
-# fdatasync on the volume .bin file (the actual object bytes). Making LMDB also
-# fsync on each commit doubles the fsync count on the PUT hot path for no real
-# safety gain — the metadata index is fully rebuildable by scanning the volume
-# files after a crash (see p2.core.volume_stats.scan_volume_stats). Set these
-# True only if you need the LMDB index itself to survive an OS-level crash
-# without a rebuild pass.
+# Defaults retain the existing throughput-oriented configuration. Syncing the
+# volume file does not make LMDB object keys/metadata durable. Enable metadata
+# sync for durability testing; scanning raw volume bytes cannot recover keys.
 S3_METADATA_LMDB_SYNC = CONFIG.y_bool("s3.metadata.lmdb.sync", default=False)
 S3_METADATA_LMDB_METASYNC = CONFIG.y_bool("s3.metadata.lmdb.metasync", default=False)
 # Whether the group committer issues fdatasync on the volume file after each
-# batch. True = data is durable on HTTP 200 (S3 semantics). Set False only for
-# throughput benchmarks where durability is not required.
+# batch. This syncs object bytes only; metadata and new-file directory durability
+# are separate concerns. Set False only when data durability is not required.
 S3_VOLUME_FDATASYNC = CONFIG.y_bool("s3.volume.fdatasync", default=True)
 # Optional bounded queue for async metadata writes (reduces PUT tail latency under concurrency).
 S3_METADATA_WRITE_QUEUE_ENABLED = CONFIG.y_bool("s3.metadata.write_queue.enabled", default=True)
@@ -106,6 +102,14 @@ S3_METADATA_WRITE_BATCH_SIZE = int(CONFIG.y("s3.metadata.write_queue.batch_size"
 # per-worker concurrency real deployments see (measured 7.3ms vs 1.3ms/op).
 S3_METADATA_WRITE_BATCH_WINDOW_MS = float(CONFIG.y("s3.metadata.write_queue.batch_window_ms", default=0.0))
 S3_BENCHMARK_TIMINGS = CONFIG.y_bool("s3.benchmark_timings", default=False)
+# Experimental RSGI PUT admission, per worker. Reserve before receiving bodies.
+S3_RSGI_MAX_BODY_BYTES = int(CONFIG.y("s3.rsgi.max_body_bytes", default=64 * 1024 * 1024))
+S3_RSGI_INFLIGHT_BYTES = int(CONFIG.y("s3.rsgi.inflight_bytes", default=256 * 1024 * 1024))
+# Warm small-object reads avoid thread hops and file-response setup. Cache
+# snapshots are invalidated by LMDB transaction IDs, not a stale-data TTL.
+S3_RSGI_SMALL_READ_BYTES = int(CONFIG.y("s3.rsgi.small_read_bytes", default=64 * 1024))
+S3_RSGI_READ_CACHE_BYTES = int(CONFIG.y("s3.rsgi.read_cache_bytes", default=64 * 1024 * 1024))
+S3_RSGI_READ_CACHE_ENTRIES = int(CONFIG.y("s3.rsgi.read_cache_entries", default=10000))
 # In-process hot-path cache TTLs (seconds) for S3 auth/ACL checks.
 S3_CACHE_APIKEY_TTL_SECONDS = float(CONFIG.y("s3.cache.apikey_ttl_seconds", default=600))
 S3_CACHE_VOLUME_TTL_SECONDS = float(CONFIG.y("s3.cache.volume_ttl_seconds", default=600))

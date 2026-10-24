@@ -1,5 +1,9 @@
 """Type stubs for the p2_s3_crypto Rust extension (PyO3)."""
 
+def write_blocks_shared(jobs: list[tuple[int, int, bytes]]) -> None:
+    """Write a batch while retaining immutable Python buffers without copying them."""
+    ...
+
 def derive_signing_key(secret_key: str, date: str, region: str, service: str) -> bytes:
     """Derive the AWS v4 signing key from secret key, date, region, and service.
 

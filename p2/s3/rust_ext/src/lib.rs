@@ -24,6 +24,7 @@ fn p2_s3_crypto(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // io_uring I/O operations
     m.add_function(wrap_pyfunction!(io_uring_writer::write_block_uring, m)?)?;
     m.add_function(wrap_pyfunction!(io_uring_writer::write_blocks_uring, m)?)?;
+    m.add_function(wrap_pyfunction!(io_uring_writer::write_blocks_shared, m)?)?;
     m.add_function(wrap_pyfunction!(io_uring_writer::fdatasync_uring, m)?)?;
     m.add_function(wrap_pyfunction!(io_uring_reader::read_block_uring, m)?)?;
     m.add_class::<io_uring_reader::RustUringBlockStreamer>()?;

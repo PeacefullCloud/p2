@@ -16,7 +16,9 @@ workers we use Django's Redis cache as a shared generation counter:
 Generation checks are throttled to once per second per key to avoid per-request
 Redis roundtrips that would kill throughput.
 """
+import asyncio
 import time
+from weakref import WeakKeyDictionary
 from collections import OrderedDict
 from typing import Optional, Tuple, Dict, Any
 from django.conf import settings
@@ -59,6 +61,57 @@ _PREFIX_MAX_SIZE = 1000  # Max cached prefix results
 _GEN_CHECK_INTERVAL = 1.0  # seconds between Redis checks
 _volume_gen_cache: dict[str, Tuple[int, float]] = {}   # bucket_name -> (gen, last_check_ts)
 _apikey_gen_cache: dict[str, Tuple[int, float]] = {}   # access_key -> (gen, last_check_ts)
+_generation_flights = WeakKeyDictionary()
+
+
+async def _refresh_generation(name, entries, key_function):
+    """Await expired generation checks without blocking the event loop.
+
+    Keep the same one-second freshness bound as the synchronous API. Concurrent
+    checks for one key share a task, but cancelling one request does not cancel
+    the shared check. Local invalidations during the read take precedence.
+    """
+    previous = entries.get(name)
+    if previous and time.monotonic() - previous[1] < _GEN_CHECK_INTERVAL:
+        return
+    flights = _generation_flights.setdefault(asyncio.get_running_loop(), {})
+    flight_key = (key_function(name), name)
+    task = flights.get(flight_key)
+    if task is None:
+        async def refresh():
+            try:
+                from django.core.cache import cache
+                value = await cache.aget(key_function(name))
+                generation = int(value) if value is not None else 0
+            except Exception:
+                generation = 0
+            if entries.get(name) is previous:
+                entries[name] = (generation, time.monotonic())
+
+        task = asyncio.create_task(refresh())
+        flights[flight_key] = task
+        task.add_done_callback(lambda done: flights.pop(flight_key, None))
+    await asyncio.shield(task)
+
+
+async def aget_cached_apikey(access_key):
+    await _refresh_generation(access_key, _apikey_gen_cache, _redis_apikey_gen_key)
+    return get_cached_apikey(access_key)
+
+
+async def aset_cached_apikey(access_key, secret_key, user_id, username, is_superuser):
+    await _refresh_generation(access_key, _apikey_gen_cache, _redis_apikey_gen_key)
+    set_cached_apikey(access_key, secret_key, user_id, username, is_superuser)
+
+
+async def aget_cached_volume(bucket_name):
+    await _refresh_generation(bucket_name, _volume_gen_cache, _redis_gen_key)
+    return get_cached_volume(bucket_name)
+
+
+async def aset_cached_volume(bucket_name, volume):
+    await _refresh_generation(bucket_name, _volume_gen_cache, _redis_gen_key)
+    set_cached_volume(bucket_name, volume)
 
 
 def _redis_gen_key(bucket_name: str) -> str:
@@ -357,6 +410,8 @@ def clear_all_caches():
     _volume_perm_cache.clear()
     _prefix_cache.clear()
     _prefix_by_volume.clear()
+    _volume_gen_cache.clear()
+    _apikey_gen_cache.clear()
 
 
 # ─── Volume permission cache ────────────────────────────────────────────────

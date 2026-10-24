@@ -202,6 +202,13 @@ _set_env_default "P2_SECURITY__SSL_REDIRECT" "false"
 
 # ── Port ───────────────────────────────────────────────────────────────────────
 PORT=8787
+INTERFACE="${P2_GRANIAN_INTERFACE:-$(_get_env_value "P2_GRANIAN_INTERFACE")}"
+INTERFACE="${INTERFACE:-rsgi}"
+case "$INTERFACE" in
+    rsgi) APP="p2.core.rsgi:application" ;;
+    asginl) APP="p2.core.asgi:application" ;;
+    *) die "P2_GRANIAN_INTERFACE must be rsgi or asginl; got: $INTERFACE" ;;
+esac
 
 # ── Dependencies ───────────────────────────────────────────────────────────────
 info "Syncing dependencies..."
@@ -259,13 +266,14 @@ elif ! [[ "$WORKERS" =~ ^[1-9][0-9]*$ ]]; then
     die "P2_GRANIAN_WORKERS must be a positive integer; got: $WORKERS"
 fi
 info "Starting granian (${WORKERS} workers; ${CORES} CPU cores)..."
+info "Using $INTERFACE interface ($APP)"
 IS_DEBUG=false
 if grep -iq '^P2_DEBUG=true' .env 2>/dev/null; then
     IS_DEBUG=true
 fi
 
 GRANIAN_ARGS=(
-    --interface asginl
+    --interface "$INTERFACE"
     --workers "$WORKERS"
     --loop uvloop
     --host 0.0.0.0
@@ -281,7 +289,7 @@ else
     GRANIAN_ARGS+=(--log --log-level error)
 fi
 
-uv run granian "${GRANIAN_ARGS[@]}" p2.core.asgi:application &
+uv run granian "${GRANIAN_ARGS[@]}" "$APP" &
 SERVER_PID=$!
 
 # ── Cleanup on exit ────────────────────────────────────────────────────────────

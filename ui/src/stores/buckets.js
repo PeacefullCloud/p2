@@ -27,6 +27,9 @@ export function useBuckets() {
       versioning: v.tags?.versioning === 'true' || v.tags?.versioning === true,
       accessPolicy: v.tags?.access_policy || 'private',
       encryption: v.tags?.encryption || 'AES-256',
+      corsRules: Array.isArray(v.tags?.['s3.p2.io/cors/rules'])
+        ? v.tags['s3.p2.io/cors/rules']
+        : [],
       permissions: v.permissions || [],
       canAdmin: (v.permissions || []).includes('admin'),
       canWrite: (v.permissions || []).includes('write'),
@@ -100,17 +103,18 @@ export function useBuckets() {
     updateError.value = null
     try {
       const token = localStorage.getItem('p2_token') || ''
+      const reqBody = {}
+      if (payload.accessPolicy !== undefined) reqBody.access_policy = payload.accessPolicy
+      if (payload.versioning !== undefined) reqBody.versioning = payload.versioning
+      if (payload.encryption !== undefined) reqBody.encryption = payload.encryption
+      if (payload.corsRules !== undefined) reqBody.cors_rules = payload.corsRules
       const resp = await fetch(`/api/v1/core/volume/${uuid}/`, {
         method: 'PUT',
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${token}`,
         },
-        body: JSON.stringify({
-          access_policy: payload.accessPolicy,
-          versioning: payload.versioning,
-          encryption: payload.encryption,
-        }),
+        body: JSON.stringify(reqBody),
       })
       if (!resp.ok) {
         const body = await resp.json().catch(() => ({}))

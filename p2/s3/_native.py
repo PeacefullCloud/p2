@@ -68,6 +68,7 @@ _CRYPTO_SURFACE = (
     "VolumePool",
     "write_block_uring",
     "write_blocks_uring",
+    "write_blocks_shared",
     "fdatasync_uring",
     "read_block_uring",
     "RustUringBlockStreamer",

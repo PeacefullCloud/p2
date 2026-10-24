@@ -50,7 +50,7 @@ fn preallocate_file(fd: std::os::unix::io::RawFd, len: u64) -> std::io::Result<(
 impl VolumePool {
     #[new]
     #[pyo3(signature = (vol_dir, volume_size_bytes = 10737418240, pool_size = 4))]
-    pub fn new(vol_dir: String, volume_size_bytes: u64, pool_size: usize) -> PyResult<Self> {
+    pub fn new(py: Python<'_>, vol_dir: String, volume_size_bytes: u64, pool_size: usize) -> PyResult<Self> {
         let path = Path::new(&vol_dir);
         if !path.exists() {
             fs::create_dir_all(path)?;
@@ -63,39 +63,46 @@ impl VolumePool {
             active_volumes: Mutex::new(Vec::new()),
         };
 
-        pool.initialize_active_pool()?;
+        py.allow_threads(|| pool.initialize_active_pool())?;
         Ok(pool)
     }
 
-    pub fn allocate_block(&self, length: u64) -> PyResult<(String, u64, i32)> {
-        let mut active = self.active_volumes.lock();
-
-        // 1. Try to find an active volume with enough space
-        for vol in active.iter_mut() {
-            if vol.write_head + length <= self.volume_size_bytes {
-                let offset = vol.write_head;
-                vol.write_head += length;
-                return Ok((vol.uuid.clone(), offset, vol.file.as_raw_fd() as i32));
+    pub fn allocate_block(&self, py: Python<'_>, length: u64) -> PyResult<(String, u64, i32)> {
+        // Offloading to a Python thread is insufficient if the extension holds
+        // the GIL while waiting for the allocator lock or preallocating a file.
+        py.allow_threads(|| {
+            if length == 0 || length > self.volume_size_bytes {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "block length must be positive and fit in a volume",
+                ));
             }
-        }
+            let mut active = self.active_volumes.lock();
 
-        // 2. No volume has enough space. Rotate: seal the first volume in the list and create a new one.
-        if !active.is_empty() {
-            let old_vol = active.remove(0);
-            self.seal_volume_file(&old_vol.path)?;
-        }
+            // Lease the descriptor before another allocation can rotate it.
+            for vol in active.iter_mut() {
+                if vol.write_head + length <= self.volume_size_bytes {
+                    let offset = vol.write_head;
+                    let fd = lease_fd(&vol.file)?;
+                    vol.write_head += length;
+                    return Ok((vol.uuid.clone(), offset, fd));
+                }
+            }
 
-        // Create new volume
-        let new_vol = self.create_volume()?;
-        let uuid = new_vol.uuid.clone();
-        let fd = new_vol.file.as_raw_fd() as i32;
-        active.push(new_vol);
+            if !active.is_empty() {
+                let old_vol = active.remove(0);
+                self.seal_volume_file(&old_vol.path)?;
+            }
 
-        let vol_ref = active.last_mut().unwrap();
-        let offset = vol_ref.write_head;
-        vol_ref.write_head += length;
+            let new_vol = self.create_volume()?;
+            let uuid = new_vol.uuid.clone();
+            let fd = lease_fd(&new_vol.file)?;
+            active.push(new_vol);
 
-        Ok((uuid, offset, fd))
+            let vol_ref = active.last_mut().unwrap();
+            let offset = vol_ref.write_head;
+            vol_ref.write_head += length;
+            Ok((uuid, offset, fd))
+        })
     }
 
     pub fn seal_full_volumes(&self) -> PyResult<Vec<String>> {
@@ -148,6 +155,17 @@ impl VolumePool {
             }
         }
         Ok(sealed)
+    }
+}
+
+fn lease_fd(file: &std::fs::File) -> PyResult<i32> {
+    // A queued write must outlive rotation of the pool's ActiveVolume. Return
+    // an owned descriptor while still holding the allocation lock.
+    let fd = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    if fd < 0 {
+        Err(std::io::Error::last_os_error().into())
+    } else {
+        Ok(fd)
     }
 }
 

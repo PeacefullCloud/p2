@@ -66,6 +66,18 @@ def _derive_signing_key(secret_key: str, date: str, region: str, service: str) -
 class SignatureMismatch(Exception):
     """Exception raised when given Hash does not match request body's hash"""
 
+
+class CachedAPIKey:
+    __slots__ = ("access_key", "_secret", "user")
+
+    def __init__(self, access_key, secret, user):
+        self.access_key = access_key
+        self._secret = secret
+        self.user = user
+
+    def decrypt_secret_key(self):
+        return self._secret
+
 # pylint: disable=too-many-instance-attributes
 class AWSv4AuthenticationRequest:
     """Holds all pieces of an AWSv4 Authenticated Request"""
@@ -221,33 +233,23 @@ class AWSV4Authentication(BaseAuth):
     async def _lookup_access_key(self, access_key: str) -> Optional[APIKey]:
         """Lookup access_key in database, return APIKey if found otherwise None.
         Uses in-memory cache to avoid database round-trips on hot paths."""
-        from p2.s3.cache import get_cached_apikey, set_cached_apikey
+        from p2.s3.cache import aget_cached_apikey, aset_cached_apikey
 
         # Check cache first — stores the already-decrypted secret, no Fernet on hot path
-        cached = get_cached_apikey(access_key)
+        cached = await aget_cached_apikey(access_key)
         if cached:
             secret_key, user_id, username, is_superuser = cached
             from django.contrib.auth.models import User
             user = User(id=user_id, username=username, is_superuser=is_superuser)
             user._state.adding = False
 
-            class CachedAPIKey:
-                def __init__(self, ak, sk, u):
-                    self.access_key = ak
-                    self._secret = sk
-                    self.user = u
-
-                def decrypt_secret_key(self):
-                    # Secret is already decrypted in cache — no Fernet overhead
-                    return self._secret
-
             return CachedAPIKey(access_key, secret_key, user)
 
         # Cache miss - hit database
         apikey = await APIKey.objects.select_related('user').filter(access_key=access_key).afirst()
         if apikey:
-            set_cached_apikey(access_key, apikey.decrypt_secret_key(), apikey.user_id,
-                            apikey.user.username, apikey.user.is_superuser)
+            await aset_cached_apikey(access_key, apikey.decrypt_secret_key(), apikey.user_id,
+                                     apikey.user.username, apikey.user.is_superuser)
         return apikey
 
     @staticmethod
@@ -293,6 +295,7 @@ class AWSV4Authentication(BaseAuth):
 
     async def validate(self) -> Optional[User]:
         """Check Authorization Header in AWS Compatible format"""
+        self.streaming_auth = None
         auth_request = AWSv4AuthenticationRequest.from_header(self.request.META)
         is_presigned = auth_request is None
         if is_presigned:
@@ -384,4 +387,14 @@ class AWSV4Authentication(BaseAuth):
             LOGGER.warning("Their sig: %s, Our sig: %s", auth_request.signature, our_signature)
             LOGGER.warning("Signature mismatch for access_key=%s", auth_request.access_key)
             raise AWSSignatureMismatch
+        # Make the verified seed context available to the bounded RSGI body
+        # decoder. Never derive or trust chunk context before this comparison.
+        if auth_request.hash in (
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
+        ):
+            from p2.s3.put_body import StreamingAuth
+            self.streaming_auth = StreamingAuth(
+                signing_key, auth_request.date_long, auth_request.credentials, our_signature,
+            )
         return secret_key.user

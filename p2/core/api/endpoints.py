@@ -157,6 +157,28 @@ def update_volume(request, volume_uuid: str, payload: VolumeUpdateSchema):
         tags['versioning'] = 'true' if payload.versioning else 'false'
     if payload.encryption is not None:
         tags['encryption'] = payload.encryption
+    if payload.cors_rules is not None:
+        from p2.s3.constants import TAG_S3_CORS_RULES
+        valid_methods = {'GET', 'PUT', 'POST', 'DELETE', 'HEAD'}
+        normalized_rules = []
+        for r in payload.cors_rules:
+            origins = [o.strip() for o in r.AllowedOrigins if o and o.strip()]
+            methods = [m.strip().upper() for m in r.AllowedMethods if m and m.strip().upper() in valid_methods]
+            if not origins or not methods:
+                continue
+            rule_dict = {
+                'AllowedOrigins': origins,
+                'AllowedMethods': methods,
+                'AllowedHeaders': [h.strip() for h in (r.AllowedHeaders or []) if h and h.strip()],
+                'ExposeHeaders': [h.strip() for h in (r.ExposeHeaders or []) if h and h.strip()],
+            }
+            if r.MaxAgeSeconds is not None and r.MaxAgeSeconds >= 0:
+                rule_dict['MaxAgeSeconds'] = int(r.MaxAgeSeconds)
+            normalized_rules.append(rule_dict)
+        if normalized_rules:
+            tags[TAG_S3_CORS_RULES] = normalized_rules
+        else:
+            tags.pop(TAG_S3_CORS_RULES, None)
 
     vol.tags = tags
     vol.save(update_fields=['tags', 'public_read'])

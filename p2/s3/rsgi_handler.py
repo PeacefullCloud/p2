@@ -1,404 +1,390 @@
-"""
-RSGI S3 Datapath Handler — Volume Pool Edition
+"""Experimental S3 fast path using only the RSGI 1.6 HTTP interface.
 
-Intercepts S3 GET/PUT single-object requests at the RSGI layer before
-Django is involved. Uses Granian's native proto API:
-
-  GET  → stream from volume pool via pread()
-  PUT  → async body read → volume pool block allocation → group commit
-  else → django_fallback(scope, proto)
-
-Falls back to Django for: multipart, ACL, tagging, bucket ops, non-S3.
+Ordinary single-object operations stay outside Django. Complex S3 semantics
+fall back before the request body is consumed. LMDB misses and allocation run
+off-loop; single-block GETs let Granian read the exact volume-file range.
 """
 import asyncio
-import datetime as _dt
+import datetime as dt
 import hashlib
 import json
 import logging
 import os
-import urllib.parse
-import uuid
-from email.utils import format_datetime
-from django.utils.dateparse import parse_datetime
+from urllib.parse import parse_qsl
 
 from django.conf import settings
 from django.core.exceptions import ObjectDoesNotExist
 from django.http import QueryDict
+from granian.rsgi import ProtocolClosed
 
-from p2.core.models import Volume
-from p2.s3.auth.aws_v4 import AWSV4Authentication
-from p2.s3.cache import (
-    get_cached_metadata, set_cached_metadata, invalidate_metadata,
-    get_cached_volume, set_cached_volume,
-)
-from p2.s3.engine import get_engine
-from p2.s3.errors import AWSError
-from p2.s3.fastpath import (
-    existing_object_state,
-    require_volume_permission,
-    update_volume_stats_for_put,
-    validate_fast_put_integrity,
-)
-from p2.s3.volume_pool import BlockCoord, VolumePool
-from p2.s3.volume_writer import write_block
-from p2.s3.volume_reader import read_object, stream_blocks, total_size as _total_size
 from p2.core.events import STREAM_BLOB_POST_SAVE, make_event, publish_event
-
-try:
-    from p2.s3 import p2_s3_crypto
-except ImportError:
-    p2_s3_crypto = None
+from p2.core.models import Volume
+from p2.lib.config import CONFIG
+from p2.s3.auth.aws_v4 import AWSV4Authentication
+from p2.s3.cache import aget_cached_volume, aset_cached_volume, invalidate_metadata
+from p2.s3.datapath import ByteBudget, RequestTimings, await_commit
+from p2.s3.engine import get_engine
+from p2.s3.errors import AWSError, AWSIncompleteBody
+from p2.s3.fastpath import (
+    put_user_metadata, require_volume_permission, update_volume_stats_for_put,
+    user_metadata_headers, validate_fast_put_integrity,
+)
+from p2.s3.put_body import CHECKSUM_HEADERS, decode_chunked_put, supports_chunked_put
+from p2.s3.read_cache import ReadCache, VolumePaths, load_read
+from p2.s3.volume_pool import BlockCoord, VolumePool
+from p2.s3.volume_reader import stream_blocks
+from p2.s3.volume_writer import write_block
 
 LOGGER = logging.getLogger(__name__)
+_BG_TASKS = set()
+_AUTH_QUERY_KEYS = frozenset({
+    "X-Amz-Algorithm", "X-Amz-Credential", "X-Amz-Date", "X-Amz-Expires",
+    "X-Amz-SignedHeaders", "X-Amz-Signature", "X-Amz-Security-Token",
+    "X-Amz-Content-Sha256",
+})
 
-# Strong references to fire-and-forget background tasks. asyncio only holds a
-# weak reference to tasks, so without this they can be GC'd before completion.
-_BG_TASKS: set = set()
+
+class S3Request:
+    __slots__ = ("method", "path", "META", "hdrs", "body", "_query", "_get")
+
+    def __init__(self, scope, headers):
+        self.method = scope.method
+        self.path = scope.path
+        self.hdrs = headers
+        self.body = b""
+        self._query = scope.query_string
+        self._get = None
+        self.META = {
+            "REQUEST_METHOD": self.method,
+            "PATH_INFO": self.path,
+            "QUERY_STRING": self._query,
+        }
+        for name in ("authorization", "x-amz-date", "x-amz-content-sha256"):
+            if name in headers:
+                self.META["HTTP_" + name.upper().replace("-", "_")] = headers[name]
+
+    @property
+    def GET(self):
+        if self._get is None:
+            self._get = QueryDict(self._query)
+        return self._get
 
 
-def _spawn_bg(coro) -> None:
-    task = asyncio.create_task(coro)
+def _spawn_bg(coroutine):
+    task = asyncio.create_task(coroutine)
     _BG_TASKS.add(task)
-    task.add_done_callback(_BG_TASKS.discard)
+    task.add_done_callback(_background_done)
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+def _background_done(task):
+    _BG_TASKS.discard(task)
+    if not task.cancelled() and task.exception() is not None:
+        LOGGER.error("S3 event publication failed: %s", type(task.exception()).__name__)
 
-def _headers_dict(scope):
-    return {k.lower(): v for k, v in scope.headers.items()}
+
+def _apply_cors(headers, volume, origin, method):
+    if not origin or volume is None:
+        return
+    from p2.s3.cors import find_matching_rule, get_cors_rules
+    rule = find_matching_rule(get_cors_rules(volume), origin, method)
+    if not rule:
+        return
+    headers.extend([
+        ("access-control-allow-origin", origin),
+        ("access-control-allow-methods", ", ".join(rule.get("AllowedMethods", []))),
+        ("vary", "Origin"),
+    ])
+    for field, header in (
+        ("AllowedHeaders", "access-control-allow-headers"),
+        ("ExposeHeaders", "access-control-expose-headers"),
+    ):
+        if rule.get(field):
+            headers.append((header, ", ".join(rule[field])))
+    if rule.get("MaxAgeSeconds") is not None:
+        headers.append(("access-control-max-age", str(rule["MaxAgeSeconds"])))
 
 
-def _is_s3_request(scope, hdrs):
-    path = scope.path
-    if path.startswith('/.well-known/') or path == '/favicon.ico':
-        return False
-    if 'x-amz-date' in hdrs:
+def _error(protocol, status, code, volume=None, origin="", method="GET"):
+    body = f'<?xml version="1.0" encoding="UTF-8"?><Error><Code>{code}</Code></Error>'.encode()
+    headers = [("content-type", "application/xml"), ("content-length", str(len(body)))]
+    _apply_cors(headers, volume, origin, method)
+    if method == "HEAD":
+        protocol.response_empty(status, headers)
+    else:
+        protocol.response_bytes(status, headers, body)
+
+
+def _needs_fallback(scope, headers):
+    if scope.method not in ("GET", "HEAD", "PUT", "DELETE"):
         return True
-    auth = hdrs.get('authorization', '')
-    if auth.startswith('AWS') or auth.startswith('Bearer'):
+    if any(name not in _AUTH_QUERY_KEYS for name, _ in parse_qsl(scope.query_string, keep_blank_values=True)):
         return True
-    qs = scope.query_string
-    if 'X-Amz-Signature' in qs or 'X-P2-Signature' in qs:
+    if any(name == "range" or name.startswith("if-") for name in headers):
         return True
-    from p2.lib.config import CONFIG
-    s3_base = CONFIG.y('s3.base_domain', 's3.example.com')
-    host = hdrs.get('host', '').split(':')[0]
-    if host.endswith('.' + s3_base):
-        return True
+    if scope.method == "PUT":
+        chunked = supports_chunked_put(headers)
+        for name in headers:
+            if name.startswith((
+                "x-amz-copy-", "x-amz-server-side-encryption",
+                "x-amz-grant-", "x-amz-object-lock-",
+            )) or name in (
+                "x-amz-acl", "x-amz-tagging", "x-amz-storage-class",
+            ):
+                return True
+            if name in ("x-amz-trailer", "x-amz-decoded-content-length") and not chunked:
+                return True
+            if name == "x-amz-checksum-type" and headers[name] == "FULL_OBJECT":
+                continue
+            if name.startswith("x-amz-checksum-") and name not in CHECKSUM_HEADERS:
+                return True
+        if not chunked and (
+            headers.get("content-encoding") or headers.get("x-amz-content-sha256", "").startswith("STREAMING-")
+        ):
+            return True
     return False
 
 
-def _extract_bucket_and_key(scope, hdrs):
-    host = hdrs.get('host', '').split(':')[0]
-    from p2.lib.config import CONFIG
-    s3_base = CONFIG.y('s3.base_domain', 's3.example.com')
-    if host.endswith('.' + s3_base):
-        bucket = host[:-(len(s3_base) + 1)]
-        key = urllib.parse.unquote(scope.path.lstrip('/'))
-        return bucket, key
-    parts = scope.path.lstrip('/').split('/', 1)
-    if not parts or not parts[0]:
-        return None, None
-    bucket = parts[0]
-    key = urllib.parse.unquote(parts[1]) if len(parts) > 1 else ''
-    return bucket, key
+def _read_metadata(volume, key):
+    engine = get_engine(volume)
+    raw = engine.get(key)
+    return engine, json.loads(raw) if raw is not None else None
 
 
-def _mock_request(scope, hdrs):
-    class _R:
-        method = scope.method
-        path = scope.path
-        META = {
-            'REQUEST_METHOD': scope.method,
-            'PATH_INFO': urllib.parse.unquote(scope.path),
-            'QUERY_STRING': scope.query_string,
-            **({'CONTENT_TYPE': hdrs['content-type']} if 'content-type' in hdrs else {}),
-            **({'CONTENT_LENGTH': hdrs['content-length']} if 'content-length' in hdrs else {}),
-            **{f"HTTP_{k.upper().replace('-','_')}": v for k, v in hdrs.items()},
-        }
-        GET = QueryDict(scope.query_string)
-        body = b''
-    return _R()
+def _read_headers(metadata, key):
+    from p2.s3.views.objects import (
+        _ACTIVE_CONTENT_TYPES, _fmt_http_date, _meta_etag, _meta_mime, _meta_mtime, _meta_size,
+    )
+    headers = [
+        ("content-type", _meta_mime(metadata, key)), ("content-length", str(_meta_size(metadata))),
+        ("accept-ranges", "bytes"), ("x-p2-datapath", "rsgi"),
+        ("x-content-type-options", "nosniff"),
+    ]
+    if headers[0][1].split(";")[0].strip().lower() in _ACTIVE_CONTENT_TYPES:
+        headers.append(("content-security-policy", "sandbox"))
+    etag = _meta_etag(metadata)
+    if etag:
+        headers.append(("etag", f'"{etag}"'))
+    modified = _fmt_http_date(_meta_mtime(metadata))
+    if modified:
+        headers.append(("last-modified", modified))
+    headers.extend(user_metadata_headers(metadata))
+    return tuple(headers)
 
 
-def _apply_rsgi_cors(resp_headers: list, volume, origin: str, method: str) -> None:
-    if not origin or not volume:
-        return
-    try:
-        from p2.s3.cors import get_cors_rules, find_matching_rule
-        rules = get_cors_rules(volume)
-        rule = find_matching_rule(rules, origin, method)
-        if rule:
-            resp_headers.append(('access-control-allow-origin', origin))
-            resp_headers.append(('access-control-allow-methods', ', '.join(rule.get('AllowedMethods', []))))
-            allowed_headers = rule.get('AllowedHeaders', [])
-            if allowed_headers:
-                resp_headers.append(('access-control-allow-headers', ', '.join(allowed_headers)))
-            expose_headers = rule.get('ExposeHeaders', [])
-            if expose_headers:
-                resp_headers.append(('access-control-expose-headers', ', '.join(expose_headers)))
-            max_age = rule.get('MaxAgeSeconds')
-            if max_age:
-                resp_headers.append(('access-control-max-age', str(max_age)))
-            resp_headers.append(('vary', 'Origin'))
-    except Exception as e:
-        LOGGER.error("S3 RSGI CORS error: %s", e)
+def _prepare_put(volume, key, headers, body, timings, streaming_auth=None):
+    from time import perf_counter
+    started = perf_counter() if timings is not None else 0
+    if supports_chunked_put(headers):
+        body, headers = decode_chunked_put(body, headers, streaming_auth)
+        if timings is not None:
+            now = perf_counter()
+            timings["body_decode"] = (now - started) * 1000
+            started = now
+    user_metadata = put_user_metadata(headers)
+    md5 = hashlib.md5(body).hexdigest()
+    sha256 = hashlib.sha256(body).hexdigest()
+    validate_fast_put_integrity(headers, body, md5, sha256)
+    if timings is not None:
+        timings["hash_integrity"] = (perf_counter() - started) * 1000
+    engine, existing = _read_metadata(volume, key)
+    handle, offset = VolumePool.get().allocate_block(len(body)) if body else (None, 0)
+    blocks = [BlockCoord(handle.uuid_hex, offset, len(body)).to_dict()] if handle else []
+    now = dt.datetime.now(dt.UTC).isoformat()
+    metadata = {
+        "size": len(body), "mime": headers.get("content-type", "application/octet-stream"),
+        "blocks": blocks, "etag": md5, "sha256": sha256, "mtime": now,
+        "ctime": (existing or {}).get("ctime", now), "is_folder": False,
+    }
+    if user_metadata:
+        metadata["user_metadata"] = user_metadata
+    return engine, handle, offset, metadata, existing, body
 
 
-async def _error(proto, status, code, volume=None, origin=''):
-    xml = (
-        f'<?xml version="1.0" encoding="UTF-8"?>'
-        f'<Error><Code>{code}</Code></Error>'
-    ).encode('utf-8')
-    headers = [('content-type', 'application/xml')]
-    if volume and origin:
-        _apply_rsgi_cors(headers, volume, origin, 'GET')
-    proto.response_bytes(status=status, headers=headers, body=xml)
+async def _put(volume, key, headers, body, timings, streaming_auth=None):
+    values = timings.values if timings is not None else None
+    engine, handle, offset, metadata, existing, body = await asyncio.to_thread(
+        _prepare_put, volume, key, headers, body, values, streaming_auth,
+    )
+    if timings:
+        timings.mark("prepare")
+    if handle is not None:
+        await write_block(handle, offset, body, engine, key, metadata, timings=values)
+    else:
+        await asyncio.to_thread(engine.put, key, json.dumps(metadata))
+    if timings:
+        timings.mark("write_metadata")
+    invalidate_metadata(volume.uuid.hex, key)
+    counted = existing is not None and not existing.get("is_folder", existing.get("blob.p2.io/is_folder", False))
+    old_size = int((existing or {}).get("size", (existing or {}).get("blob.p2.io/size/bytes", 0)) or 0)
+    update_volume_stats_for_put(volume, counted, old_size, len(body))
+    if settings.S3_ASYNC_EVENT_PUBLISH:
+        event = make_event(
+            blob_uuid=os.urandom(8).hex(), volume_uuid=volume.uuid.hex, event_type="blob_post_save",
+        )
+        event.update({"blob_path": key, "mime": metadata["mime"], "blocks": metadata["blocks"]})
+        _spawn_bg(publish_event(STREAM_BLOB_POST_SAVE, event))
+    return metadata
 
-
-# ── Main RSGI app factory ─────────────────────────────────────────────────────
 
 def S3ProxyRSGIApp(django_fallback):
-    """RSGI application that intercepts S3 GET/PUT single-object traffic."""
+    base_domain = CONFIG.y("s3.base_domain", "s3.example.com")
+    max_body = min(settings.S3_RSGI_MAX_BODY_BYTES, settings.VOLUME_SIZE_BYTES)
+    budget = ByteBudget(settings.S3_RSGI_INFLIGHT_BYTES)
+    paths = VolumePaths(settings.STORAGE_ROOT)
+    small_limit = max(0, settings.S3_RSGI_SMALL_READ_BYTES)
+    reads = ReadCache(settings.S3_RSGI_READ_CACHE_ENTRIES, settings.S3_RSGI_READ_CACHE_BYTES)
+    if max_body <= 0 or max_body > budget.capacity:
+        raise ValueError("RSGI max body must be positive and no larger than its byte budget")
 
-    async def app(scope, proto):
-        if scope.proto != 'http':
-            return await django_fallback(scope, proto)
+    async def app(scope, protocol):
+        if scope.proto != "http":
+            return await django_fallback(scope, protocol)
+        if scope.path.startswith(("/_/", "/api/", "/.well-known/")) or scope.path == "/favicon.ico":
+            return await django_fallback(scope, protocol)
 
-        hdrs = _headers_dict(scope)
-        origin = hdrs.get('origin', '')
-
-        if not _is_s3_request(scope, hdrs):
-            return await django_fallback(scope, proto)
-
-        method = scope.method
-        qs = scope.query_string
-
-        # Defer complex ops to Django
-        if any(x in qs for x in ('uploadId', 'tagging', 'acl')):
-            return await django_fallback(scope, proto)
-
-        bucket, key = _extract_bucket_and_key(scope, hdrs)
+        # RSGI headers are already lower-case and Rust-backed.
+        headers = scope.headers
+        if "host" not in headers and scope.authority:
+            headers = dict(headers.items())
+            headers["host"] = scope.authority
+        host = headers.get("host", "").split(":", 1)[0]
+        is_s3 = (
+            headers.get("authorization", "").startswith("AWS")
+            or "x-amz-date" in headers or "X-Amz-Signature=" in scope.query_string
+            or host.endswith("." + base_domain)
+        )
+        if not is_s3 or _needs_fallback(scope, headers):
+            return await django_fallback(scope, protocol)
+        if host.endswith("." + base_domain):
+            bucket, key = host[:-(len(base_domain) + 1)], scope.path.lstrip("/")
+        else:
+            parts = scope.path.lstrip("/").split("/", 1)
+            bucket, key = parts[0], parts[1] if len(parts) == 2 else ""
         if not bucket or not key:
-            return await django_fallback(scope, proto)
+            return await django_fallback(scope, protocol)
 
-        if method not in ('GET', 'PUT', 'DELETE'):
-            return await django_fallback(scope, proto)
-
-        # ── Auth ──────────────────────────────────────────────────────────────
-        mock_req = _mock_request(scope, hdrs)
-        try:
-            if not AWSV4Authentication.can_handle(mock_req):
-                return await django_fallback(scope, proto)
-            user = await AWSV4Authentication(mock_req).validate()
-            if not user:
-                return await _error(proto, 403, 'AccessDenied')
-        except AWSError as e:
-            return await _error(proto, e.status, e.code)
-        except Exception as e:
-            LOGGER.error("S3 RSGI auth error: %s", e)
-            return await _error(proto, 500, 'InternalError')
-
-        # ── Volume lookup ─────────────────────────────────────────────────────
-        try:
-            volume = get_cached_volume(bucket)
-            if not volume:
-                volume = await Volume.objects.aget(name=bucket)
-                set_cached_volume(bucket, volume)
-        except ObjectDoesNotExist:
-            return await _error(proto, 404, 'NoSuchBucket')
-
-        pool = VolumePool.get()
-
-        # ── GET ───────────────────────────────────────────────────────────────
-        if method == 'GET':
+        content_length = 0
+        if scope.method == "PUT":
             try:
-                await require_volume_permission(user, volume, 'read', bucket, key)
-            except AWSError as e:
-                return await _error(proto, e.status, e.code, volume=volume, origin=origin)
-
-            attributes = get_cached_metadata(volume.uuid.hex, key)
-            if attributes is None:
-                engine = get_engine(volume)
-                # LMDB get is a lock-free mmap read (~1-5us); running it inline
-                # is cheaper than an asyncio.to_thread dispatch (~30-100us).
-                metadata_json = engine.get(key)
-                if not metadata_json:
-                    return await _error(proto, 404, 'NoSuchKey', volume=volume, origin=origin)
-                attributes = json.loads(metadata_json)
-                set_cached_metadata(volume.uuid.hex, key, attributes)
-
-            # New schema fields
-            content_type = attributes.get('mime', attributes.get('blob.p2.io/mime', 'application/octet-stream'))
-            obj_size = int(attributes.get('size', attributes.get('blob.p2.io/size/bytes', 0)) or 0)
-            etag = attributes.get('etag', attributes.get('blob.p2.io/hash/md5', ''))
-
-            last_mod_str = attributes.get('mtime', attributes.get('blob.p2.io/stat/mtime', ''))
-            last_mod = ''
-            if last_mod_str:
-                dt = parse_datetime(last_mod_str)
-                if dt is None:
-                    try:
-                        dt = _dt.datetime.fromtimestamp(float(last_mod_str), tz=_dt.UTC)
-                    except (ValueError, OverflowError):
-                        pass
-                if dt:
-                    last_mod = format_datetime(dt, usegmt=True)
-
-            resp_headers = [
-                ('content-type', content_type),
-                ('content-length', str(obj_size)),
-                ('accept-ranges', 'bytes'),
-            ]
-            if etag:
-                resp_headers.append(('etag', f'"{etag}"'))
-            if last_mod:
-                resp_headers.append(('last-modified', last_mod))
-            _apply_rsgi_cors(resp_headers, volume, origin, method)
-
-            blocks_raw = attributes.get('blocks', [])
-            if blocks_raw:
-                # New volume-pool schema: stream from block coords
-                blocks = [BlockCoord.from_dict(b) for b in blocks_raw]
-                if obj_size <= 4 * 1024 * 1024:
-                    data = await read_object(pool, blocks)
-                    proto.response_bytes(status=200, headers=resp_headers, body=data)
-                else:
-                    proto.response_str(status=200, headers=resp_headers)
-                    async for chunk in stream_blocks(pool, blocks):
-                        await proto.send_bytes(chunk)
-                    await proto.close()
-            else:
-                # Legacy schema with internal_path — fall back to Django
-                return await django_fallback(scope, proto)
-            return
-
-        # ── PUT ───────────────────────────────────────────────────────────────
-        if method == 'PUT':
-            is_versioned = (volume.tags or {}).get('versioning') == 'true'
-            if is_versioned:
-                return await django_fallback(scope, proto)
-
-            try:
-                content_length = int(hdrs.get('content-length', '-1'))
+                content_length = int(headers.get("content-length", "-1"))
             except ValueError:
-                return await _error(proto, 400, 'InvalidRequest')
+                return _error(protocol, 400, "InvalidRequest", method="PUT")
+            if content_length == -1 or content_length > max_body:
+                return await django_fallback(scope, protocol)
+            if content_length < 0:
+                return _error(protocol, 400, "InvalidRequest", method="PUT")
+            # Framed PUTs retain encoded and decoded buffers through commit.
+            admission_bytes = content_length * (2 if supports_chunked_put(headers) else 1)
+            if admission_bytes > budget.capacity:
+                return await django_fallback(scope, protocol)
 
-            content_encoding = hdrs.get('content-encoding', '')
-            is_aws_chunked = 'aws-chunked' in content_encoding or 'x-amz-decoded-content-length' in hdrs
+        timings = RequestTimings() if settings.S3_BENCHMARK_TIMINGS else None
+        origin = headers.get("origin", "")
+        volume = None
+        try:
+            request = S3Request(scope, headers)
+            if not AWSV4Authentication.can_handle(request):
+                return await django_fallback(scope, protocol)
+            authenticator = AWSV4Authentication(request)
+            user = await authenticator.validate()
+            if user is None:
+                return _error(protocol, 403, "AccessDenied", method=scope.method)
+            if timings:
+                timings.mark("auth")
+            volume = await aget_cached_volume(bucket)
+            if volume is None:
+                volume = await Volume.objects.aget(name=bucket)
+                await aset_cached_volume(bucket, volume)
+            if timings:
+                timings.mark("volume")
+            if scope.method in ("PUT", "DELETE") and (volume.tags or {}).get("versioning") == "true":
+                return await django_fallback(scope, protocol)
+            permission = {"GET": "read", "HEAD": "read", "PUT": "write", "DELETE": "delete"}[scope.method]
+            await require_volume_permission(user, volume, permission, bucket, key)
+            if timings:
+                timings.mark("permission")
 
-            # Fast-path: only handle contiguous uploads ≤ 64 MiB
-            if content_length > 64 * 1024 * 1024 or content_length == -1:
-                return await django_fallback(scope, proto)
+            if scope.method in ("GET", "HEAD"):
+                cache_key = (volume.uuid.hex, key)
+                entry = reads.get(cache_key, scope.method == "GET", small_limit)
+                cache_hit = entry is not None
+                if entry is None:
+                    entry = await asyncio.to_thread(
+                        load_read, volume, key, paths, small_limit, scope.method == "GET",
+                    )
+                    if entry is not None:
+                        reads.put(cache_key, entry)
+                if timings:
+                    timings.mark("metadata_read")
+                if entry is None:
+                    return _error(protocol, 404, "NoSuchKey", volume, origin, scope.method)
+                metadata = entry.metadata
+                if "blocks" not in metadata or metadata.get("sse_algorithm") or metadata.get("compressed"):
+                    return await django_fallback(scope, protocol)
+                from p2.s3.views.objects import _meta_size
+                size = _meta_size(metadata)
+                if entry.headers is None:
+                    entry.headers = _read_headers(metadata, key)
+                # Only snapshot-derived headers are cached. CORS and timings
+                # must be rebuilt for this request, after authorization.
+                response_headers = list(entry.headers)
+                _apply_cors(response_headers, volume, origin, scope.method)
+                if timings:
+                    response_headers.append(timings.header())
+                    response_headers.append(("x-p2-read-cache", "hit" if cache_hit else "miss"))
+                if scope.method == "HEAD" or size == 0:
+                    return protocol.response_empty(200, response_headers)
+                if entry.body is not None:
+                    return protocol.response_bytes(200, response_headers, entry.body)
+                blocks = [BlockCoord.from_dict(item) for item in metadata["blocks"]]
+                if sum(block.length for block in blocks) != size:
+                    return _error(protocol, 500, "InternalError", volume, origin, scope.method)
+                if len(blocks) == 1:
+                    block = blocks[0]
+                    return protocol.response_file_range(
+                        200, response_headers, paths.get_volume_path(block.vol_uuid),
+                        block.offset, block.offset + block.length,
+                    )
+                transport = protocol.response_stream(200, response_headers)
+                async for chunk in stream_blocks(paths, blocks):
+                    await transport.send_bytes(chunk)
+                return
 
-            try:
-                await require_volume_permission(user, volume, 'write', bucket, key)
-            except AWSError as e:
-                return await _error(proto, e.status, e.code, volume=volume, origin=origin)
+            if scope.method == "PUT":
+                async with budget.reserve(admission_bytes):
+                    if timings:
+                        timings.mark("admission")
+                    body = await protocol()
+                    if len(body) != content_length:
+                        raise AWSIncompleteBody
+                    if timings:
+                        timings.mark("body_receive")
+                    metadata = await await_commit(_put(
+                        volume, key, headers, body, timings, getattr(authenticator, "streaming_auth", None),
+                    ))
+                response_headers = [
+                    ("etag", f'"{metadata["etag"]}"'), ("content-length", "0"),
+                    ("x-p2-put-fastpath", "1"), ("x-p2-datapath", "rsgi"),
+                ]
+                _apply_cors(response_headers, volume, origin, "PUT")
+                if timings:
+                    response_headers.append(timings.header())
+                return protocol.response_empty(200, response_headers)
 
-            body_chunks = []
-            async for chunk in proto:
-                body_chunks.append(chunk)
-            body = b''.join(body_chunks)
-
-            if is_aws_chunked:
-                from p2.s3.utils import decode_aws_chunked
-                body = decode_aws_chunked(body)
-
-            # Compute hashes with Python hashlib (fast enough for small bodies).
-            # Previously called p2_s3_crypto.write_and_hash_small('/dev/null', body)
-            # which wrote to /dev/null (wasted I/O) then discarded the result.
-            final_md5 = hashlib.md5(body).hexdigest()
-            final_sha256 = hashlib.sha256(body).hexdigest()
-
-            try:
-                validate_fast_put_integrity(hdrs, body, final_md5, final_sha256)
-            except AWSError as e:
-                return await _error(proto, e.status, e.code, volume=volume, origin=origin)
-
-            engine = get_engine(volume)
-            # Skip LMDB read for non-versioned buckets (saves 1 LMDB txn per PUT).
-            if is_versioned:
-                existing_json, existing_size, existing_counted = await existing_object_state(engine, key)
-            else:
-                existing_json, existing_size, existing_counted = None, 0, False
-
-            # Allocate block in volume pool
-            blob_size = len(body)
-            now_iso = _dt.datetime.now(_dt.UTC).isoformat()
-            client_ct = hdrs.get('content-type', 'application/octet-stream')
-
-            if blob_size > 0:
-                handle, offset = await asyncio.to_thread(pool.allocate_block, blob_size)
-                block = BlockCoord(vol_uuid=handle.uuid_hex, offset=offset, length=blob_size)
-                blocks = [block]
-            else:
-                handle = None
-                offset = 0
-                blocks = []
-
-            metadata_payload = {
-                'size': blob_size,
-                'mime': client_ct,
-                'blocks': [b.to_dict() for b in blocks],
-                'etag': final_md5,
-                'sha256': final_sha256,
-                'mtime': now_iso,
-                'ctime': now_iso,
-                'is_folder': False,
-            }
-            meta_json = json.dumps(metadata_payload)
-
-            if handle is not None:
-                # write_block routes through the group-commit batcher: pwrite
-                # + fdatasync + LMDB commit are coalesced with other
-                # concurrent PUTs into one batch instead of each PUT paying
-                # its own fsync + LMDB commit serially.
-                await write_block(handle, offset, body, engine, key, meta_json)
-            else:
-                await asyncio.to_thread(engine.put, key, meta_json)
-
-            invalidate_metadata(volume.uuid.hex, key)
-            if existing_json:
-                from p2.s3.cache import invalidate_volume_global
-                invalidate_volume_global(bucket)
-            # Volume stats are approximate and flushed to the DB every ~2s, so
-            # don't gate the HTTP 200 on the Redis round-trip — fire it in the
-            # background. adjust_volume_stats swallows its own exceptions.
-            _spawn_bg(
-                update_volume_stats_for_put(volume, existing_counted, existing_size, blob_size)
-            )
-
-            if getattr(settings, 'S3_ASYNC_EVENT_PUBLISH', False):
-                event = make_event(
-                    blob_uuid=os.urandom(8).hex(),
-                    volume_uuid=volume.uuid.hex,
-                    event_type='blob_post_save',
-                )
-                event.update({'blob_path': key, 'mime': client_ct, 'blocks': [b.to_dict() for b in blocks]})
-                _spawn_bg(publish_event(STREAM_BLOB_POST_SAVE, event))
-
-            put_headers = [
-                ('etag', f'"{final_md5}"'),
-                ('content-length', '0'),
-                ('x-p2-put-fastpath', '1'),
-            ]
-            _apply_rsgi_cors(put_headers, volume, origin, method)
-            proto.response_empty(status=200, headers=put_headers)
-            return
-
-        # ── DELETE ───────────────────────────────────────────────────────────
-        if method == 'DELETE':
-            try:
-                await require_volume_permission(user, volume, 'delete', bucket, key)
-            except AWSError as e:
-                return await _error(proto, e.status, e.code, volume=volume, origin=origin)
-
-            engine = get_engine(volume)
+            engine = await asyncio.to_thread(get_engine, volume)
             await asyncio.to_thread(engine.delete, key)
             invalidate_metadata(volume.uuid.hex, key)
-
-            proto.response_empty(status=204, headers=[('content-length', '0')])
+            response_headers = [("content-length", "0"), ("x-p2-datapath", "rsgi")]
+            _apply_cors(response_headers, volume, origin, "DELETE")
+            if timings:
+                timings.mark("metadata_delete")
+                response_headers.append(timings.header())
+            protocol.response_empty(204, response_headers)
+        except ObjectDoesNotExist:
+            _error(protocol, 404, "NoSuchBucket", method=scope.method)
+        except AWSError as exc:
+            _error(protocol, exc.status, exc.code, volume, origin, scope.method)
+        except ProtocolClosed:
             return
 
     return app

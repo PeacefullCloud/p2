@@ -103,6 +103,9 @@ class VolumeHandle:
                 pass
             self._fd = None
 
+    def __del__(self):
+        self.close()
+
     @property
     def fd(self) -> int:
         if self._fd is None:
@@ -214,6 +217,8 @@ class VolumePool:
             raise ValueError("allocate_block: length must be > 0")
 
         if self._rust_pool is not None:
+            # The native pool returns an owned descriptor lease. WriteJob keeps
+            # this handle alive until data sync and metadata commit finish.
             uuid_hex, offset, fd = self._rust_pool.allocate_block(length)
             path = self._volume_path(uuid_hex)
             handle = VolumeHandle(uuid_hex=uuid_hex, path=path, size_limit=_volume_size_bytes())

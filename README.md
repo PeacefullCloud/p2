@@ -13,6 +13,15 @@ fork of the archived [BeryJu/p2](https://github.com/BeryJu/p2).
 It is built to handle petabyte-scale metadata via LMDB and high object
 throughput by sidestepping traditional framework bottlenecks.
 
+## RSGI experiment
+
+This branch defaults to Granian's RSGI interface for ordinary object operations.
+Django still handles management and complex S3 operations through an explicit
+HTTP adapter. LMDB and the on-disk metadata format are unchanged.
+
+See [the experiment guide](docs/rsgi-experiment.md) for build requirements,
+ASGI/RSGI comparisons, timing headers, and isolated integration tests.
+
 ## Features
 
 - **S3 API compatibility** — works with AWS SDKs, MinIO tooling (`warp`),
@@ -22,7 +31,7 @@ throughput by sidestepping traditional framework bottlenecks.
 - **Proxy-free reads** — Granian streams object bytes directly from the
   append-only volume files; block ranges are resolved from LMDB with no
   reverse proxy and no `sendfile()` handoff.
-- **Framework-less write path** — a raw ASGI interceptor takes S3 `PUT` bytes
+- **Framework-less write path** — an RSGI handler takes S3 `PUT` bytes
   off the Granian sockets before Django middleware runs.
 - **Append-only volume pool** — fixed-size preallocated volume files, batched
   and fsync-durable writes, with atomic LMDB metadata commits.
@@ -102,8 +111,9 @@ sign-in.
   run.
 - **Throughput can degrade as the dataset grows** and partially recovers on
   restart; not yet diagnosed.
-- **Durability defaults favor throughput.** Set `P2_S3__VOLUME__FDATASYNC=true`
-  for durable-on-200 semantics; doing so adds PUT latency.
+- **Durability defaults favor throughput.** Data-file sync alone does not make
+  object keys and metadata crash-durable. See the experiment guide's durability
+  settings and recovery limitations before comparing durable PUT performance.
 - **PUT-heavy workloads are bound by per-request Python overhead** (auth, ORM,
   Redis) rather than disk.
 

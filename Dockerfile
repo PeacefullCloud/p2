@@ -31,7 +31,7 @@ COPY wheels/ /wheels/
 RUN --mount=type=cache,target=/root/.cache/uv \
     VIRTUAL_ENV=/app/.venv uv pip install --reinstall --no-deps /wheels/*.whl \
     && P2_REQUIRE_NATIVE=1 /app/.venv/bin/python -c \
-       "import p2_s3_crypto, p2_s3_checksum; print('native extensions OK')"
+       "import p2_s3_crypto, p2_s3_checksum; assert hasattr(p2_s3_crypto, 'write_blocks_shared'), 'Rebuild experimental wheels with scripts/build_rust_ext.sh'; print('native extensions OK')"
 
 FROM python:3.12.13-slim AS app
 

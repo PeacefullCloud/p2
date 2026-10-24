@@ -22,6 +22,7 @@ from p2.s3.errors import (
     AWSContentSignatureMismatch,
     AWSIncompleteBody,
     AWSInvalidDigest,
+    AWSInvalidArgument,
 )
 from p2.s3.policy import AccessCheckResult, check_access, parse_policy
 
@@ -106,7 +107,6 @@ def validate_fast_put_integrity(
     blob_size: int = -1,
 ) -> None:
     """Validate integrity headers for fast-path PUT."""
-    has_body = len(body) > 0
     size = blob_size if blob_size >= 0 else len(body)
 
     decoded_len = headers.get("x-amz-decoded-content-length")
@@ -133,26 +133,56 @@ def validate_fast_put_integrity(
         if not _constant_time_equal(expected_md5, _b64_md5_from_hex(final_md5_hex)):
             raise AWSBadDigest
 
-    if has_body:
-        expected_crc32 = headers.get("x-amz-checksum-crc32")
-        if expected_crc32:
-            crc32_b64 = base64.b64encode(
-                (binascii.crc32(body) & 0xFFFFFFFF).to_bytes(4, "big", signed=False)
-            ).decode("ascii")
-            if not _constant_time_equal(expected_crc32, crc32_b64):
-                raise AWSBadDigest
+    expected_crc32 = headers.get("x-amz-checksum-crc32")
+    if expected_crc32:
+        crc32_b64 = base64.b64encode(
+            (binascii.crc32(body) & 0xFFFFFFFF).to_bytes(4, "big", signed=False)
+        ).decode("ascii")
+        if not _constant_time_equal(expected_crc32, crc32_b64):
+            raise AWSBadDigest
 
-        expected_sha1 = headers.get("x-amz-checksum-sha1")
-        if expected_sha1:
-            sha1_b64 = base64.b64encode(hashlib.sha1(body).digest()).decode("ascii")
-            if not _constant_time_equal(expected_sha1, sha1_b64):
-                raise AWSBadDigest
+    expected_crc32c = headers.get("x-amz-checksum-crc32c")
+    if expected_crc32c:
+        from p2.s3._native import checksum
+        if checksum is not None:
+            actual = checksum.compute_crc32c(body)
+        else:
+            from p2.s3.checksum import _py_compute_crc32c
+            actual = _py_compute_crc32c(body)
+        if not _constant_time_equal(expected_crc32c, actual):
+            raise AWSBadDigest
+
+    expected_sha1 = headers.get("x-amz-checksum-sha1")
+    if expected_sha1:
+        sha1_b64 = base64.b64encode(hashlib.sha1(body).digest()).decode("ascii")
+        if not _constant_time_equal(expected_sha1, sha1_b64):
+            raise AWSBadDigest
 
     expected_sha256 = headers.get("x-amz-checksum-sha256")
     if expected_sha256:
         sha256_b64 = base64.b64encode(binascii.unhexlify(final_sha256_hex)).decode("ascii")
         if not _constant_time_equal(expected_sha256, sha256_b64):
             raise AWSBadDigest
+
+
+def put_user_metadata(headers):
+    """Preserve ordinary SDK metadata without sending the whole PUT to Django."""
+    result = {}
+    for name, value in headers.items():
+        name = name.lower()
+        if name.startswith("x-amz-meta-"):
+            if hasattr(headers, "get_all"):
+                value = ", ".join(headers.get_all(name))
+            if not name[11:]:
+                raise AWSInvalidArgument
+            result[name[11:]] = value
+    if sum(len(name.encode("utf-8")) + len(value.encode("utf-8")) for name, value in result.items()) > 2048:
+        raise AWSInvalidArgument
+    return result
+
+
+def user_metadata_headers(metadata):
+    return [("x-amz-meta-" + name, value) for name, value in metadata.get("user_metadata", {}).items()]
 
 
 async def existing_object_state(engine, key: str) -> tuple[str | None, int, bool]:

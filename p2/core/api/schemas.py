@@ -24,10 +24,18 @@ class VolumeCreateSchema(Schema):
     storage_uuid: Optional[str] = None
     tags: Optional[dict] = None
 
+class CorsRuleSchema(Schema):
+    AllowedOrigins: List[str]
+    AllowedMethods: List[str]
+    AllowedHeaders: List[str] = []
+    ExposeHeaders: List[str] = []
+    MaxAgeSeconds: Optional[int] = None
+
 class VolumeUpdateSchema(Schema):
     access_policy: Optional[str] = None
     versioning: Optional[bool] = None
     encryption: Optional[str] = None
+    cors_rules: Optional[List[CorsRuleSchema]] = None
 
 class FolderCreateSchema(Schema):
     prefix: str = ""

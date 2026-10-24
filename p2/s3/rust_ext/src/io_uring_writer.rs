@@ -1,9 +1,11 @@
 use std::fs::File;
+#[cfg(not(feature = "io_uring"))]
 use std::os::unix::fs::FileExt;
 use std::os::unix::io::FromRawFd;
 
 use md5::Md5;
 use pyo3::prelude::*;
+use pyo3::pybacked::PyBackedBytes;
 use sha2::{Digest, Sha256};
 
 #[cfg(feature = "io_uring")]
@@ -15,11 +17,43 @@ use std::sync::OnceLock;
 #[cfg(feature = "io_uring")]
 use tokio::sync::oneshot;
 
+enum WriteBuffer {
+    Owned(Vec<u8>),
+    Shared(PyBackedBytes),
+}
+
+impl AsRef<[u8]> for WriteBuffer {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Owned(bytes) => bytes,
+            Self::Shared(bytes) => bytes.as_ref(),
+        }
+    }
+}
+
+// SAFETY: Vec storage is never resized after submission. PyBackedBytes keeps
+// its immutable Python bytes (or a private immutable copy of bytearray) alive.
+// Both allocations have stable addresses when the wrapper moves. This buffer
+// is write-only: never implement IoBufMut for Python-owned immutable bytes.
 #[cfg(feature = "io_uring")]
+unsafe impl tokio_uring::buf::IoBuf for WriteBuffer {
+    fn stable_ptr(&self) -> *const u8 {
+        self.as_ref().as_ptr()
+    }
+
+    fn bytes_init(&self) -> usize {
+        self.as_ref().len()
+    }
+
+    fn bytes_total(&self) -> usize {
+        self.as_ref().len()
+    }
+}
+
 struct WriteSpec {
     fd: i32,
     offset: u64,
-    data: Vec<u8>,
+    data: WriteBuffer,
 }
 
 #[cfg(feature = "io_uring")]
@@ -102,9 +136,10 @@ fn submit_uring_job(job: UringJob) -> std::io::Result<()> {
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "io_uring writer stopped"))?
 }
 
+#[cfg(not(feature = "io_uring"))]
 fn fallback_write(spec: WriteSpec) -> std::io::Result<()> {
     let file = unsafe { File::from_raw_fd(spec.fd) };
-    let result = file.write_all_at(&spec.data, spec.offset);
+    let result = file.write_all_at(spec.data.as_ref(), spec.offset);
     std::mem::forget(file); // Do not close the Python-owned descriptor.
     result
 }
@@ -122,7 +157,7 @@ pub fn write_block_uring(
     py.allow_threads(move || {
         let md5_hex = hex::encode(Md5::digest(&data_vec));
         let sha256_hex = hex::encode(Sha256::digest(&data_vec));
-        let spec = WriteSpec { fd, offset, data: data_vec };
+        let spec = WriteSpec { fd, offset, data: WriteBuffer::Owned(data_vec) };
 
         #[cfg(feature = "io_uring")]
         submit_uring_job(UringJob::Single(WriteJob {
@@ -149,7 +184,7 @@ pub fn write_blocks_uring(
     py.allow_threads(move || {
         let specs: Vec<WriteSpec> = jobs
             .into_iter()
-            .map(|(fd, offset, data)| WriteSpec { fd, offset, data })
+            .map(|(fd, offset, data)| WriteSpec { fd, offset, data: WriteBuffer::Owned(data) })
             .collect();
         if specs.is_empty() {
             return Ok(());
@@ -167,6 +202,36 @@ pub fn write_blocks_uring(
             fallback_write(spec).map_err(pyo3::exceptions::PyOSError::new_err)?;
         }
 
+        Ok(())
+    })
+}
+
+/// Retain immutable Python payload buffers through completion, without making
+/// a Rust Vec copy while holding the GIL. The blocking wait releases the GIL.
+#[pyfunction]
+pub fn write_blocks_shared(
+    py: Python<'_>,
+    jobs: Vec<(i32, u64, PyBackedBytes)>,
+) -> PyResult<()> {
+    let specs: Vec<WriteSpec> = jobs
+        .into_iter()
+        .map(|(fd, offset, data)| WriteSpec { fd, offset, data: WriteBuffer::Shared(data) })
+        .collect();
+    py.allow_threads(move || {
+        if specs.is_empty() {
+            return Ok(());
+        }
+        #[cfg(feature = "io_uring")]
+        submit_uring_job(UringJob::Batch(BatchWriteJob {
+            specs,
+            tx: oneshot::channel().0,
+        }))
+        .map_err(pyo3::exceptions::PyOSError::new_err)?;
+
+        #[cfg(not(feature = "io_uring"))]
+        for spec in specs {
+            fallback_write(spec).map_err(pyo3::exceptions::PyOSError::new_err)?;
+        }
         Ok(())
     })
 }

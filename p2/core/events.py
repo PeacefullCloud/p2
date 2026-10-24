@@ -18,6 +18,7 @@ Delivery guarantees:
 
 import logging
 import asyncio
+import json
 from datetime import datetime, timezone
 
 import redis.asyncio as aioredis
@@ -148,8 +149,26 @@ def make_event(blob_uuid: str, volume_uuid: str, event_type: str) -> dict:
     }
 
 
+def _stream_fields(event: dict) -> dict:
+    """Redis stream values are scalar; structured fields use JSON on the wire.
+
+    Keep existing scalar fields unchanged. In particular, do not JSON-quote
+    identifiers or paths. Consumers can json.loads() structured fields such as
+    blocks, just as they already do for exif_json.
+    """
+    return {
+        name: json.dumps(value, separators=(",", ":"))
+        if value is None or isinstance(value, (list, dict, tuple, bool))
+        else value
+        for name, value in event.items()
+    }
+
+
 async def publish_event(stream: str, event: dict) -> str:
     """Publish *event* to *stream*. Returns the Redis message ID."""
+    # Normalize once, before either direct XADD or queued/pipelined delivery.
+    # This also snapshots mutable structured values before queueing.
+    event = _stream_fields(event)
     if _queue_enabled():
         await _ensure_publish_worker()
         try:
@@ -212,7 +231,7 @@ async def _dead_letter(r, stream, group, msg_id, data, exc):
         "dead_lettered_at": datetime.now(timezone.utc).isoformat(),
     }
     try:
-        await r.xadd(STREAM_DEAD_LETTER, payload, maxlen=STREAM_MAX_LEN, approximate=True)
+        await r.xadd(STREAM_DEAD_LETTER, _stream_fields(payload), maxlen=STREAM_MAX_LEN, approximate=True)
         await r.xack(stream, group, msg_id)
         logger.error("dead-lettered message %s from %s: %s", msg_id, stream, exc)
     except aioredis.RedisError as redis_exc:

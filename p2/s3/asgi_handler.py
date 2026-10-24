@@ -29,8 +29,10 @@ from p2.s3.errors import AWSError
 from p2.s3.fastpath import (
     existing_object_state,
     hash_put_body,
+    put_user_metadata,
     require_volume_permission,
     update_volume_stats_for_put,
+    user_metadata_headers,
     validate_fast_put_integrity,
 )
 from p2.s3.volume_pool import BlockCoord, VolumePool
@@ -348,6 +350,10 @@ def S3ProxyASGIApp(django_app):
             if lm:
                 resp_h.append((b'last-modified', lm))
             _apply_asgi_cors(resp_h, volume, origin, method)
+            resp_h.extend(
+                (name.encode("ascii"), value.encode("latin1"))
+                for name, value in user_metadata_headers(attributes)
+            )
 
             await send({'type': _PUT_RESPONSE_START_TYPE, 'status': 200, 'headers': resp_h})
             if size <= 4 * 1024 * 1024:
@@ -417,6 +423,7 @@ def S3ProxyASGIApp(django_app):
 
             try:
                 validate_fast_put_integrity(hdrs, body, final_md5, final_sha256, blob_size=blob_size)
+                user_metadata = put_user_metadata(hdrs)
             except AWSError as e:
                 return await _s3_error(send, e.status, e.code, volume=volume, origin=origin)
 
@@ -456,6 +463,8 @@ def S3ProxyASGIApp(django_app):
                 'is_folder': False,
                 'internal_path': internal_path,
             }
+            if user_metadata:
+                meta_payload["user_metadata"] = user_metadata
 
             if handle is not None:
                 await write_block(handle, offset, body, engine, key, meta_payload, md5_hash_bytes)

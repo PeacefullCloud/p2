@@ -180,7 +180,7 @@ impl RustUringBlockStreamer {
             let mut buf = vec![0u8; to_read];
             let bytes_read = file.read_at(&mut buf, absolute_offset)?;
             buf.truncate(bytes_read);
-            Ok(buf)
+            Ok::<Vec<u8>, std::io::Error>(buf)
         })?;
 
         // Update offsets

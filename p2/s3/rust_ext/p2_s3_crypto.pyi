@@ -88,7 +88,11 @@ class VolumePool:
         pool_size: int = 4,
     ) -> None: ...
     def allocate_block(self, length: int) -> tuple[str, int, int]:
-        """Reserve *length* bytes. Returns ``(vol_uuid, offset, fd)``."""
+        """Reserve *length* bytes. Returns ``(vol_uuid, offset, owned_fd)``.
+
+        The caller must close the descriptor after its write/sync completes.
+        The lease remains valid if the allocator rotates the original volume.
+        """
         ...
 
     def seal_full_volumes(self) -> list[str]:
@@ -126,7 +130,14 @@ def write_blocks_uring(jobs: list[tuple[int, int, bytes]]) -> None:
     """Submit ``(fd, offset, data)`` writes as one batch.
 
     Returns once every write has completed, or raises the first I/O error.
-    This is the write path used by p2.s3.volume_writer.
+    Retained copying interface; p2.s3.volume_writer uses write_blocks_shared.
+    """
+    ...
+
+def write_blocks_shared(jobs: list[tuple[int, int, bytes]]) -> None:
+    """Write a batch while retaining immutable Python bytes through completion.
+
+    No payload Vec copies are made. The blocking wait releases the GIL.
     """
     ...
 
